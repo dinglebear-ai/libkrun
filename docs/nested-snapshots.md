@@ -80,14 +80,21 @@ Sources:
 ## Linux x86 implementation status
 
 The draft backend transports bounded KVM nested-state blobs and restores them after
-ordinary CPU/MSR state, before saved vCPU events. Nested payloads use backend ABI 2;
-ordinary payloads remain ABI 1. No dependency version bump is needed.
+ordinary CPU/MSR state, before saved vCPU events. Nested payloads use backend ABI 3
+and include source KVM feature MSRs; ordinary payloads remain ABI 1. No dependency
+version bump is needed. A read-only preflight checks every paused destination vCPU's
+CPUID, TSC frequency, MSR inventory and KVM feature MSRs before restoring VM state.
 
-The VMM admission gate deliberately remains closed. Framing tests, cross-compilation,
-and a native idle-vCPU state transfer passed on a disposable GCloud Linux x86 host.
-This does not qualify running-inner-VM restore. Before enabling the backend, finish
-Intel and AMD live restore tests, destination feature validation, and review restore
-ordering against each vendor's active nested state.
+The VMM admission gate deliberately remains closed. On 2026-10-13 an Intel GCloud
+host passed diagnostic capture and fresh-process restore of a running KVM inner VM,
+two independent restores from one baseline, and a second capture/restore generation.
+The fixture checks workload identity, counter progress and PIT interrupt progress.
+The ordinary build still refuses nested capture. Native idle-state transfer,
+incompatible-feature rejection and bounded codec checks also passed.
+
+These diagnostic results do not qualify AMD Linux, broader interrupt workloads,
+cross-host migration or sandbox filesystem recovery. Complete those checks and
+review each vendor's active nested restore ordering before opening admission.
 
 ## Windows x86 implementation status
 
@@ -98,3 +105,4 @@ installs nested state before APIC/SynIC state. Missing nested state is an error.
 The VMM gate remains closed. Active nested restore ordering, destination VMX/SVM
 compatibility, and repeated fresh-partition restore still require native qualification.
 This layer does not add Windows ARM support or claim that the ARM API has the same state type.
+
