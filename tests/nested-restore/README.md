@@ -41,3 +41,9 @@ It does not qualify sandbox filesystem recovery or CPU migration across hosts.
 restores from one baseline, and capture/restore of a second generation using the
 candidate KVM capability contract and the diagnostic guard bypass. AMD Linux and
 Windows require their own live-restore results before admission can open.
+
+On Windows the harness uses an explicit `hvc0` output device. The 2026-10-13 AMD
+run captured successfully in a diagnostic build, but restore resumed the counter
+without continued PIT interrupts. Progress lines include IF flags and PIC state
+to help distinguish interrupt generation from a masked or in-service interrupt.
+This failure must remain a failure; counter progress alone is insufficient.
