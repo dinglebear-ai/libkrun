@@ -4,14 +4,43 @@
 use std::io;
 use std::os::fd::AsRawFd;
 
-use kvm_bindings::KVM_CAP_NESTED_STATE;
+use kvm_bindings::{Msrs, KVM_CAP_NESTED_STATE};
 use kvm_ioctls::{Kvm, VcpuFd};
+use serde::{Deserialize, Serialize};
 
 const HEADER_SIZE: usize = 128;
 const MAX_STATE_SIZE: usize = 1024 * 1024;
 // Linux x86 UAPI: _IOWR/_IOW(KVMIO, 0xbe/0xbf, struct kvm_nested_state).
 const GET_NESTED_STATE: libc::c_ulong = 0xc080_aebe;
 const SET_NESTED_STATE: libc::c_ulong = 0x4080_aebf;
+
+/// Host feature MSRs are immutable capabilities, distinct from vCPU runtime MSRs.
+/// Exact equality intentionally restricts this draft to the same CPU contract.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct Snapshot {
+    pub(super) state: Vec<u8>,
+    pub(super) feature_msrs: Vec<(u32, u64)>,
+}
+
+fn feature_msrs() -> io::Result<Vec<(u32, u64)>> {
+    let kvm = Kvm::new().map_err(io::Error::from)?;
+    let indices = kvm.get_msr_feature_index_list().map_err(io::Error::from)?;
+    let mut entries = Msrs::new(indices.as_slice().len()).map_err(io::Error::other)?;
+    for (entry, index) in entries.as_mut_slice().iter_mut().zip(indices.as_slice()) {
+        entry.index = *index;
+    }
+    let count = kvm.get_msrs(&mut entries).map_err(io::Error::from)?;
+    if count != entries.as_slice().len() {
+        return Err(io::Error::other("KVM returned incomplete feature MSRs"));
+    }
+    let mut features = entries
+        .as_slice()
+        .iter()
+        .map(|entry| (entry.index, entry.data))
+        .collect::<Vec<_>>();
+    features.sort_unstable_by_key(|(index, _)| *index);
+    Ok(features)
+}
 
 fn capacity() -> io::Result<usize> {
     let capacity = Kvm::new()
@@ -44,7 +73,7 @@ fn validate(bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn capture(vcpu: &VcpuFd) -> io::Result<Vec<u8>> {
+pub(super) fn capture(vcpu: &VcpuFd) -> io::Result<Snapshot> {
     let capacity = capacity()?;
     // u64 storage provides alignment for the UAPI header; zero initialization also
     // prevents uninitialized padding from entering the snapshot.
@@ -65,11 +94,21 @@ pub(super) fn capture(vcpu: &VcpuFd) -> io::Result<Vec<u8>> {
     }
     let state = &bytes[..used];
     validate(state)?;
-    Ok(state.to_vec())
+    Ok(Snapshot {
+        state: state.to_vec(),
+        feature_msrs: feature_msrs()?,
+    })
 }
 
-pub(super) fn validate_destination(bytes: &[u8]) -> io::Result<()> {
+pub(super) fn validate_destination(snapshot: &Snapshot) -> io::Result<()> {
+    let bytes = &snapshot.state;
     validate(bytes)?;
+    if snapshot.feature_msrs != feature_msrs()? {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "destination KVM feature MSRs differ from nested snapshot",
+        ));
+    }
     if bytes.len() > capacity()? {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -79,8 +118,9 @@ pub(super) fn validate_destination(bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn restore(vcpu: &VcpuFd, bytes: &[u8]) -> io::Result<()> {
-    validate_destination(bytes)?;
+pub(super) fn restore(vcpu: &VcpuFd, snapshot: &Snapshot) -> io::Result<()> {
+    validate_destination(snapshot)?;
+    let bytes = &snapshot.state;
     let mut words = vec![0_u64; bytes.len().div_ceil(8)];
     // SAFETY: the allocation covers bytes.len() bytes and is suitably aligned.
     let aligned =
@@ -114,6 +154,15 @@ mod tests {
         destination.set_cpuid2(&cpuid).unwrap();
         restore(&destination, &saved).unwrap();
         assert_eq!(capture(&destination).unwrap(), saved);
+
+        let before = capture(&destination).unwrap();
+        let mut incompatible = saved;
+        incompatible.feature_msrs.push((u32::MAX, 0));
+        assert_eq!(
+            restore(&destination, &incompatible).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(capture(&destination).unwrap(), before);
     }
 
     #[test]
