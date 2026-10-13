@@ -47,7 +47,7 @@ int main(void) {
         0xb0,0x04,0xe6,0x21, 0xb0,0x01,0xe6,0x21,
         0xb0,0xfe,0xe6,0x21, 0xb0,0x36,0xe6,0x43,
         0xb0,0xff,0xe6,0x40,0xe6,0x40, 0xfb,
-        0x66,0xff,0x06,0x00,0x08, 0xeb,0xf9
+        0x9c,0x58,0xa3,0x08,0x08, 0x66,0xff,0x06,0x00,0x08, 0xeb,0xf4
     };
     const uint8_t interrupt[] = {0x50,0x66,0xff,0x06,0x04,0x08,0xb0,0x20,0xe6,0x20,0x58,0xcf};
     memcpy(memory+0x1000, code, sizeof(code));
@@ -69,7 +69,11 @@ int main(void) {
     pthread_t thread;
     if(pthread_create(&thread,NULL,execute,NULL))fail("pthread_create");
     for (;;) {
-        printf("NESTED_PROGRESS %u %u %llu\n", counter[0], counter[1], (unsigned long long)identity);
+        struct kvm_irqchip pic = {.chip_id = KVM_IRQCHIP_PIC_MASTER};
+        if (ioctl(vm, KVM_GET_IRQCHIP, &pic) < 0) fail("KVM_GET_IRQCHIP");
+        printf("NESTED_PROGRESS %u %u %llu flags=%x irr=%x isr=%x imr=%x\n",
+               counter[0], counter[1], (unsigned long long)identity,
+               counter[2] & 0xffff, pic.chip.pic.irr, pic.chip.pic.isr, pic.chip.pic.imr);
         fflush(stdout);
         usleep(100000);
     }

@@ -106,3 +106,11 @@ The VMM gate remains closed. Active nested restore ordering, destination VMX/SVM
 compatibility, and repeated fresh-partition restore still require native qualification.
 This layer does not add Windows ARM support or claim that the ARM API has the same state type.
 
+
+On 2026-10-13 the AMD Windows Server 2025 host passed diagnostic capture of a
+running KVM child. Fresh-process restore retained the workload identity and
+counter progress, but PIT interrupts stopped after one more tick. The inner IF
+flag remained set and PIC IRR/ISR were empty. Reapplying the outer APIC state
+after resuming partition time did not repair the failure; restoring NestedState
+before ordinary registers was rejected by WHP. Neither experiment is committed.
+The public guard stays closed until interrupt progress also survives restore.
