@@ -76,3 +76,15 @@ Sources:
 - https://docs.hetzner.com/cloud/servers/windows-on-cloud/
 - https://docs.hetzner.com/cloud/servers/faq/
 - https://docs.hetzner.com/robot/dedicated-server/server-lines/apple-rx-server/
+
+## Linux x86 implementation status
+
+The draft backend transports bounded KVM nested-state blobs and restores them after
+ordinary CPU/MSR state, before saved vCPU events. Nested payloads use backend ABI 2;
+ordinary payloads remain ABI 1. No dependency version bump is needed.
+
+The VMM admission gate deliberately remains closed. Framing tests, cross-compilation,
+and a native idle-vCPU state transfer passed on a disposable GCloud Linux x86 host.
+This does not qualify running-inner-VM restore. Before enabling the backend, finish
+Intel and AMD live restore tests, destination feature validation, and review restore
+ordering against each vendor's active nested state.

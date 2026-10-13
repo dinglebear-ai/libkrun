@@ -1793,6 +1793,12 @@ impl Vcpu {
     #[cfg(target_arch = "x86_64")]
     fn capture_execution_state(&self) -> Result<Vec<u8>> {
         let state = self.save_state()?;
+        if self.nested_state_enabled() {
+            let nested = super::nested_state::capture(&self.fd)
+                .map_err(|error| Error::StateCodec(format!("capture nested state: {error}")))?;
+            return bincode::serde::encode_to_vec(&(state, nested), bincode::config::standard())
+                .map_err(|error| Error::StateCodec(error.to_string()));
+        }
         bincode::serde::encode_to_vec(&state, bincode::config::standard())
             .map_err(|error| Error::StateCodec(error.to_string()))
     }
@@ -1800,6 +1806,20 @@ impl Vcpu {
     /// Restores a backend payload while running on the owning vCPU thread.
     #[cfg(target_arch = "x86_64")]
     fn restore_execution_state(&self, bytes: &[u8]) -> Result<()> {
+        if self.nested_state_enabled() {
+            let ((state, nested), consumed): ((VcpuState, Vec<u8>), usize) =
+                bincode::serde::decode_from_slice(
+                    bytes,
+                    bincode::config::standard().with_limit::<{ 16 * 1024 * 1024 }>(),
+                )
+                .map_err(|error| Error::StateCodec(error.to_string()))?;
+            if consumed != bytes.len() {
+                return Err(Error::StateCodec("trailing nested vCPU state bytes".into()));
+            }
+            super::nested_state::validate_destination(&nested)
+                .map_err(|error| Error::StateCodec(format!("validate nested state: {error}")))?;
+            return self.restore_state_with_nested(state, Some(&nested));
+        }
         let (state, consumed): (VcpuState, usize) =
             bincode::serde::decode_from_slice(bytes, bincode::config::standard())
                 .map_err(|error| Error::StateCodec(error.to_string()))?;
@@ -1807,6 +1827,18 @@ impl Vcpu {
             return Err(Error::StateCodec("trailing vCPU state bytes".to_string()));
         }
         self.restore_state(state)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn nested_state_enabled(&self) -> bool {
+        self.cpuid.as_slice().iter().any(|entry| {
+            entry.index == 0
+                && match entry.function {
+                    1 => entry.ecx & (1 << 5) != 0,
+                    0x8000_0001 => entry.ecx & (1 << 2) != 0,
+                    _ => false,
+                }
+        })
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -1836,6 +1868,11 @@ impl Vcpu {
     #[allow(unused)]
     #[cfg(target_arch = "x86_64")]
     fn restore_state(&self, state: VcpuState) -> Result<()> {
+        self.restore_state_with_nested(state, None)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn restore_state_with_nested(&self, state: VcpuState, nested: Option<&[u8]>) -> Result<()> {
         /*
          * Ordering requirements:
          *
@@ -1915,6 +1952,11 @@ impl Vcpu {
                 "KVM restored {restored_msrs} of {} MSRs",
                 msrs.as_slice().len()
             )));
+        }
+        // Restore nested mode after the CPU/MSRs, before injecting saved events.
+        if let Some(nested) = nested {
+            super::nested_state::restore(&self.fd, nested)
+                .map_err(|error| Error::StateCodec(format!("restore nested state: {error}")))?;
         }
         self.fd
             .set_vcpu_events(&state.vcpu_events)

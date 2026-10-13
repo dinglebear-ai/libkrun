@@ -430,14 +430,14 @@ fn current_execution_backend() -> ExecutionBackend {
 }
 
 #[cfg(target_os = "macos")]
-fn current_execution_backend_state_abi() -> u32 {
+fn current_execution_backend_state_abi(_nested_enabled: bool) -> u32 {
     // ABI 2 adds the per-vCPU GIC CPU-interface state that is separate from the process-wide HVF
     // distributor artifact. ABI 1 cannot safely deliver interrupts after construction restore.
     2
 }
 
 #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
-fn current_execution_backend_state_abi() -> u32 {
+fn current_execution_backend_state_abi(_nested_enabled: bool) -> u32 {
     // ARM64 activity state is mandatory: old artifacts cannot distinguish
     // online CPUs from processors intentionally left startup-suspended.
     2
@@ -447,15 +447,20 @@ fn current_execution_backend_state_abi() -> u32 {
     target_os = "macos",
     all(target_os = "windows", target_arch = "aarch64")
 )))]
-fn current_execution_backend_state_abi() -> u32 {
-    1
+fn current_execution_backend_state_abi(nested_enabled: bool) -> u32 {
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) && nested_enabled {
+        // Nested vCPU payloads append the KVM nested-state blob to ordinary CPU state.
+        2
+    } else {
+        1
+    }
 }
 
 fn execution_state_backend_is_compatible(state: &ExecutionState, nested_enabled: bool) -> bool {
     state.nested_enabled() == nested_enabled
         && state.architecture() == current_execution_architecture()
         && state.backend() == current_execution_backend()
-        && state.backend_state_abi() == current_execution_backend_state_abi()
+        && state.backend_state_abi() == current_execution_backend_state_abi(nested_enabled)
 }
 
 fn incremental_capture_is_not_beneficial(
@@ -1465,7 +1470,7 @@ impl Vmm {
         ExecutionState::new(
             current_execution_architecture(),
             current_execution_backend(),
-            current_execution_backend_state_abi(),
+            current_execution_backend_state_abi(self.nested_enabled),
             pause_generation.request_id().get(),
             vm_state,
             vcpus,
@@ -2447,7 +2452,7 @@ mod tests {
 
     #[test]
     fn execution_backend_rejects_an_old_abi() {
-        let current_abi = current_execution_backend_state_abi();
+        let current_abi = current_execution_backend_state_abi(false);
         let state = ExecutionState::new(
             current_execution_architecture(),
             current_execution_backend(),
@@ -2466,7 +2471,7 @@ mod tests {
         let state = ExecutionState::new(
             current_execution_architecture(),
             current_execution_backend(),
-            current_execution_backend_state_abi(),
+            current_execution_backend_state_abi(false),
             1,
             Vec::new(),
             Vec::new(),
@@ -2477,6 +2482,9 @@ mod tests {
         assert!(!execution_state_backend_is_compatible(&state, true));
         let nested = state.with_nested_enabled(true);
         assert!(!execution_state_backend_is_compatible(&nested, false));
-        assert!(execution_state_backend_is_compatible(&nested, true));
+        assert_eq!(
+            execution_state_backend_is_compatible(&nested, true),
+            current_execution_backend_state_abi(false) == current_execution_backend_state_abi(true)
+        );
     }
 }
