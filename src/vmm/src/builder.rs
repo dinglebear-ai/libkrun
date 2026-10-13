@@ -1850,6 +1850,7 @@ pub fn build_microvm_paused(
         control_request_id: VcpuControlRequestId::INITIAL,
         execution_state: VmmExecutionState::Paused(PauseGeneration::INITIAL),
         execution_restore_allowed: true,
+        nested_enabled: vm_resources.nested_enabled,
         memory_restore_allowed: true,
         memory_ledger: MemoryGenerationLedger::new(MemoryTopologyGeneration::new(1)),
         memory_access: devices::virtio::MemoryAccessDomain::new(),
