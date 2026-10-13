@@ -6,6 +6,14 @@ use windows_sys::Win32::System::Hypervisor::*;
 use super::{ApParkState, ApStartupRouter, Error, Result};
 
 //--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+// WHvVirtualProcessorStateTypeNestedState from the x64 WHP API. The pinned
+// windows-sys bindings do not yet expose this state category.
+const NESTED_STATE: i32 = 0x0000_1002;
+
+//--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
 
@@ -74,12 +82,16 @@ pub(super) fn restore_vm(
     Ok(())
 }
 
-pub(super) fn capture_cpu(partition: WHV_PARTITION_HANDLE, id: u32) -> Result<Vec<u8>> {
+pub(super) fn capture_cpu(
+    partition: WHV_PARTITION_HANDLE,
+    id: u32,
+    nested_enabled: bool,
+) -> Result<Vec<u8>> {
     let cpu = u8::try_from(id).map_err(codec)?;
     let names = register_names(partition, cpu)?;
     let values = super::get_vcpu_register_bytes(partition, cpu, &names)?;
     let get = |kind| super::get_virtual_processor_state(partition, id, kind);
-    encode(&CpuState {
+    let state = CpuState {
         registers: names.into_iter().zip(values).collect(),
         xsave: get(WHvVirtualProcessorStateTypeXsaveState)?,
         apic: get(WHvVirtualProcessorStateTypeInterruptControllerState2)?,
@@ -88,12 +100,34 @@ pub(super) fn capture_cpu(partition: WHV_PARTITION_HANDLE, id: u32) -> Result<Ve
             get(WHvVirtualProcessorStateTypeSynicEventFlagPage)?,
             get(WHvVirtualProcessorStateTypeSynicTimerState)?,
         ],
-    })
+    };
+    if nested_enabled {
+        let nested = get(NESTED_STATE)?;
+        if nested.is_empty() {
+            return Err(codec("WHP returned no nested execution state"));
+        }
+        encode(&(state, nested))
+    } else {
+        encode(&state)
+    }
 }
 
-pub(super) fn restore_cpu(partition: WHV_PARTITION_HANDLE, id: u32, bytes: &[u8]) -> Result<()> {
+pub(super) fn restore_cpu(
+    partition: WHV_PARTITION_HANDLE,
+    id: u32,
+    bytes: &[u8],
+    nested_enabled: bool,
+) -> Result<()> {
     let cpu = u8::try_from(id).map_err(codec)?;
-    let state: CpuState = decode(bytes)?;
+    let (state, nested): (CpuState, Option<Vec<u8>>) = if nested_enabled {
+        let (state, nested): (CpuState, Vec<u8>) = decode(bytes)?;
+        if nested.is_empty() {
+            return Err(codec("missing WHP nested execution state"));
+        }
+        (state, Some(nested))
+    } else {
+        (decode(bytes)?, None)
+    };
     let names = register_names(partition, cpu)?;
     if names
         != state
@@ -118,6 +152,11 @@ pub(super) fn restore_cpu(partition: WHV_PARTITION_HANDLE, id: u32, bytes: &[u8]
         WHvVirtualProcessorStateTypeXsaveState,
         &state.xsave,
     )?;
+    // Nested control state is separate from registers and XSAVE. Keep it ahead
+    // of interrupt-controller restoration; live Intel/AMD qualification is required.
+    if let Some(nested) = nested {
+        super::set_virtual_processor_state(partition, id, NESTED_STATE, &nested)?;
+    }
     super::set_virtual_processor_state(
         partition,
         id,

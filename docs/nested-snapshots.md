@@ -88,3 +88,13 @@ and a native idle-vCPU state transfer passed on a disposable GCloud Linux x86 ho
 This does not qualify running-inner-VM restore. Before enabling the backend, finish
 Intel and AMD live restore tests, destination feature validation, and review restore
 ordering against each vendor's active nested state.
+
+## Windows x86 implementation status
+
+The draft backend requests WHP's bounded opaque NestedState blob alongside its existing
+CPU state, retains ordinary ABI 1 payloads, and uses ABI 2 for nested payloads. Restore
+installs nested state before APIC/SynIC state. Missing nested state is an error.
+
+The VMM gate remains closed. Active nested restore ordering, destination VMX/SVM
+compatibility, and repeated fresh-partition restore still require native qualification.
+This layer does not add Windows ARM support or claim that the ARM API has the same state type.

@@ -448,8 +448,12 @@ fn current_execution_backend_state_abi(_nested_enabled: bool) -> u32 {
     all(target_os = "windows", target_arch = "aarch64")
 )))]
 fn current_execution_backend_state_abi(nested_enabled: bool) -> u32 {
-    if cfg!(all(target_os = "linux", target_arch = "x86_64")) && nested_enabled {
-        // Nested vCPU payloads append the KVM nested-state blob to ordinary CPU state.
+    if cfg!(all(
+        any(target_os = "linux", target_os = "windows"),
+        target_arch = "x86_64"
+    )) && nested_enabled
+    {
+        // Nested vCPU payloads append the backend nested-state blob to ordinary CPU state.
         2
     } else {
         1
