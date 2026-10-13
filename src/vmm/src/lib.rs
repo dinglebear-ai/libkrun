@@ -448,12 +448,11 @@ fn current_execution_backend_state_abi(_nested_enabled: bool) -> u32 {
     all(target_os = "windows", target_arch = "aarch64")
 )))]
 fn current_execution_backend_state_abi(nested_enabled: bool) -> u32 {
-    if cfg!(all(
-        any(target_os = "linux", target_os = "windows"),
-        target_arch = "x86_64"
-    )) && nested_enabled
-    {
-        // Nested vCPU payloads append the backend nested-state blob to ordinary CPU state.
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) && nested_enabled {
+        // ABI 3 binds the nested-state blob to the source KVM feature MSRs.
+        3
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) && nested_enabled {
+        // WHP nested payloads append the backend state blob to ordinary CPU state.
         2
     } else {
         1
@@ -1508,6 +1507,54 @@ impl Vmm {
                 .any(|(index, vcpu)| vcpu.id() != index as u32)
         {
             return Err(Error::ExecutionStateTopologyMismatch);
+        }
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if self.nested_enabled {
+            let request_id = self.next_control_request_id()?;
+            for (handle, vcpu) in self.vcpus_handles.iter().zip(state.vcpus()) {
+                if let Err(error) = handle.send_event(VcpuEvent::ValidateState {
+                    request_id,
+                    bytes: vcpu.bytes().to_vec(),
+                }) {
+                    // A partial dispatch leaves outstanding replies. Do not reuse
+                    // this control channel after losing its synchronization.
+                    self.execution_state = VmmExecutionState::Indeterminate;
+                    return Err(Error::VcpuEvent(error));
+                }
+            }
+            let deadline = Instant::now() + VCPU_CONTROL_TIMEOUT;
+            let mut first_error = None;
+            // Drain every response, including after a rejection, so a later request
+            // cannot consume a leftover acknowledgement from this preflight.
+            for (vcpu_index, handle) in self.vcpus_handles.iter().enumerate() {
+                let result = match handle.response_receiver().recv_deadline(deadline) {
+                    Ok(VcpuResponse::StateValidated {
+                        request_id: response_id,
+                        result,
+                    }) if response_id == request_id => result.map_err(Error::ExecutionStateBackend),
+                    Ok(response) => {
+                        self.execution_state = VmmExecutionState::Indeterminate;
+                        Err(Error::ExecutionStateBackend(format!(
+                            "unexpected preflight response: {response:?}"
+                        )))
+                    }
+                    Err(_) => {
+                        self.execution_state = VmmExecutionState::Indeterminate;
+                        Err(Error::VcpuControlTimeout {
+                            operation: "nested restore preflight",
+                            request_id,
+                            vcpu_index,
+                        })
+                    }
+                };
+                if let Err(error) = result {
+                    first_error.get_or_insert(error);
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
         }
 
         self.execution_state = VmmExecutionState::Indeterminate;
