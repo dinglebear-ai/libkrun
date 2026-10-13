@@ -35,13 +35,18 @@ fn run(cpu: &HvfVcpu) {
     let (stop, wait) = std::sync::mpsc::channel();
     let id = cpu.id();
     let watchdog = std::thread::spawn(move || {
-        if wait.recv_timeout(Duration::from_secs(2)).is_err() {
+        let timed_out = wait.recv_timeout(Duration::from_secs(2)).is_err();
+        if timed_out {
             hvf::vcpu_request_exit(id).unwrap();
         }
+        timed_out
     });
     let result = unsafe { hv_vcpu_run(cpu.id()) };
     stop.send(()).ok();
-    watchdog.join().unwrap();
+    assert!(
+        !watchdog.join().unwrap(),
+        "EL2 run exceeded watchdog deadline"
+    );
     assert_eq!(result, HV_SUCCESS);
     let mut pc = 0;
     assert_eq!(
