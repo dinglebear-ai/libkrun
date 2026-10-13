@@ -104,6 +104,7 @@ fn main() {
     println!("captured EL2 counter=1 GIC bytes={}", gic.len());
     destroy(cpu, vm);
 
+    let mut second_generation = None;
     for generation in 0..2 {
         let mut restored_ram = Box::new(Ram(ram.0));
         let (vm, mut cpu) = create(&mut restored_ram);
@@ -120,6 +121,28 @@ fn main() {
             1
         );
         println!("fresh EL2 restore {generation}: counter=2; baseline unchanged");
+        assert_eq!(
+            unsafe { hv_vcpu_set_trap_debug_exceptions(cpu.id(), false) },
+            HV_SUCCESS
+        );
+        second_generation = Some((
+            cpu.capture_state().expect("recapture CPU"),
+            vm.capture_gic_state().expect("recapture GIC"),
+            restored_ram,
+        ));
         destroy(cpu, vm);
     }
+
+    let (state, gic, mut ram) = second_generation.unwrap();
+    let (vm, mut cpu) = create(&mut ram);
+    vm.restore_gic_state(&gic).expect("restore recaptured GIC");
+    cpu.restore_state(&state).expect("restore recaptured CPU");
+    cpu.write_reg(hv_reg_t_HV_REG_PC, 0x80000010).unwrap();
+    run(&cpu);
+    assert_eq!(
+        u64::from_le_bytes(ram.0[16384..16392].try_into().unwrap()),
+        3
+    );
+    println!("second-generation EL2 restore: counter=3");
+    destroy(cpu, vm);
 }

@@ -17,11 +17,13 @@ tests/nested-restore-hvf/target/debug/nested-hvf-probe
 The guest run has a two-second watchdog. A capture failure exits nonzero after
 destroying the test VM. No register is silently omitted to make capture succeed.
 
-Observed on Apple M5 Pro, macOS 26.5.1 (25F80): EL2 execution increments the
-counter, but `hv_vcpu_get_sys_reg(MDCR_EL2)` returns `0xfae94003`
-(`HV_BAD_ARGUMENT`). Production CPU capture therefore fails before either
-restore attempt. This is a snapshot blocker, not evidence that EL2 execution is
-unsupported.
+Observed on Apple M5 Pro, macOS 26.5.1 (25F80): production CPU and GIC
+capture succeeds, and two fresh VMs independently resume the saved counter
+from 1 to 2 without changing the baseline RAM. Recapturing the restored VM
+and restoring it again advances the counter to 3. This required correcting the
+old SDK's MDCR_EL2 encoding and reading the implemented virtual interrupt
+list-register count from ICH_VTR_EL2 (eight on this Mac). Restore rejects a
+destination with a different list-register inventory before writing CPU state.
 
 `macos-capability.c` separately queries the framework's EL2 capability. A true
 result only advertises execution support; it does not establish snapshot support.
