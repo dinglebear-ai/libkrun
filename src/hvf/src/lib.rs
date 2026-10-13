@@ -257,7 +257,7 @@ pub enum Error {
     VcpuReadPendingInterrupt,
     VcpuReadGicRegister(&'static str, u16),
     VcpuReadSimdRegister,
-    VcpuReadSystemRegister,
+    VcpuReadSystemRegister(hv_sys_reg_t),
     VcpuReadVtimer,
     VcpuRequestExit,
     VcpuRun,
@@ -303,7 +303,9 @@ impl Display for Error {
                 write!(f, "Error reading HVF vCPU GIC {kind} register {reg:#x}")
             }
             VcpuReadSimdRegister => write!(f, "Error reading HVF vCPU SIMD register"),
-            VcpuReadSystemRegister => write!(f, "Error reading HVF vCPU system register"),
+            VcpuReadSystemRegister(reg) => {
+                write!(f, "Error reading HVF vCPU system register {reg:#x}")
+            }
             VcpuReadVtimer => write!(f, "Error reading HVF vCPU virtual timer state"),
             VcpuRequestExit => write!(f, "Error requesting HVF vCPU exit"),
             VcpuRun => write!(f, "Error running HVF vCPU"),
@@ -1049,10 +1051,10 @@ impl HvfVcpu<'_> {
     }
 
     fn read_sys_reg(&self, reg: u16) -> Result<u64, Error> {
-        let val: u64 = 0;
-        let ret = unsafe { hv_vcpu_get_sys_reg(self.vcpuid, reg, &val as *const _ as *mut _) };
+        let mut val: u64 = 0;
+        let ret = unsafe { hv_vcpu_get_sys_reg(self.vcpuid, reg, &mut val) };
         if ret != HV_SUCCESS {
-            Err(Error::VcpuReadSystemRegister)
+            Err(Error::VcpuReadSystemRegister(reg))
         } else {
             Ok(val)
         }
