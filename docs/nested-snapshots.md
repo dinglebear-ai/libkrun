@@ -114,3 +114,12 @@ flag remained set and PIC IRR/ISR were empty. Reapplying the outer APIC state
 after resuming partition time did not repair the failure; restoring NestedState
 before ordinary registers was rejected by WHP. Neither experiment is committed.
 The public guard stays closed until interrupt progress also survives restore.
+
+## macOS native qualification
+
+On Apple M5 Pro with macOS 26.5.1 (25F80), the framework advertises EL2 and the
+native probe executes an EL2 counter. Production CPU capture then fails at
+`MDCR_EL2` with `HV_BAD_ARGUMENT` (`0xfae94003`). Fresh-VM restore is not reached.
+The probe in `tests/nested-restore-hvf` preserves this failure and rejects watchdog
+cancellation as successful execution. No register is omitted, and nested snapshot
+admission remains closed. This probe is smaller than a running inner-VM test.
