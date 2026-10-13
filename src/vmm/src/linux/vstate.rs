@@ -1816,6 +1816,65 @@ impl Vcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
+    fn validate_execution_restore(&self, bytes: &[u8]) -> Result<()> {
+        let (state, nested) =
+            VcpuState::decode_execution_payload(bytes, self.nested_state_enabled())?;
+        if let Some(nested) = &nested {
+            super::nested_state::validate_destination(nested)
+                .map_err(|error| Error::StateCodec(format!("validate nested state: {error}")))?;
+            self.validate_nested_cpu_contract(&state, nested)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn validate_nested_cpu_contract(
+        &self,
+        state: &VcpuState,
+        nested: &super::nested_state::Snapshot,
+    ) -> Result<()> {
+        let expected = self
+            .cpuid
+            .as_slice()
+            .iter()
+            .copied()
+            .map(KvmCpuidEntryState::from)
+            .collect::<Vec<_>>();
+        if state.cpuid != expected {
+            return Err(Error::StateCodec(
+                "destination CPUID differs from nested snapshot".into(),
+            ));
+        }
+        let frequency = self.fd.get_tsc_khz().map_err(Error::VcpuGetTscKhz)?;
+        if state.tsc_khz != frequency {
+            return Err(Error::StateCodec(
+                "destination TSC frequency differs from nested snapshot".into(),
+            ));
+        }
+        if state
+            .msrs
+            .iter()
+            .any(|entry| !self.msr_list.as_slice().contains(&entry.index))
+        {
+            return Err(Error::StateCodec(
+                "destination is missing nested snapshot MSRs".into(),
+            ));
+        }
+        let vmx = self
+            .cpuid
+            .as_slice()
+            .iter()
+            .any(|entry| entry.function == 1 && entry.ecx & (1 << 5) != 0);
+        let expected_format = if vmx { 0_u16 } else { 1 };
+        if u16::from_le_bytes(nested.state[2..4].try_into().unwrap()) != expected_format {
+            return Err(Error::StateCodec(
+                "nested snapshot vendor differs from destination".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
     fn nested_state_enabled(&self) -> bool {
         self.cpuid.as_slice().iter().any(|entry| {
             entry.index == 0
@@ -1858,7 +1917,11 @@ impl Vcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn restore_state_with_nested(&self, state: VcpuState, nested: Option<&[u8]>) -> Result<()> {
+    fn restore_state_with_nested(
+        &self,
+        state: VcpuState,
+        nested: Option<&super::nested_state::Snapshot>,
+    ) -> Result<()> {
         /*
          * Ordering requirements:
          *
@@ -1885,6 +1948,9 @@ impl Vcpu {
             return Err(Error::StateCodec(
                 "KVM execution state exceeds the supported register inventory".to_string(),
             ));
+        }
+        if let Some(nested) = nested {
+            self.validate_nested_cpu_contract(&state, nested)?;
         }
         let mut cpuid =
             CpuId::new(state.cpuid.len()).map_err(|error| Error::StateCodec(error.to_string()))?;
@@ -2206,6 +2272,15 @@ impl Vcpu {
                     .send(VcpuResponse::StateCaptured { request_id, result })
                     .expect("failed to send captured vCPU state");
             }
+            #[cfg(target_arch = "x86_64")]
+            Ok(VcpuEvent::ValidateState { request_id, .. }) => {
+                self.response_sender
+                    .send(VcpuResponse::StateValidated {
+                        request_id,
+                        result: Err("restore preflight requires a paused vCPU".into()),
+                    })
+                    .expect("failed to send validation response");
+            }
             Ok(VcpuEvent::RestoreState { request_id, bytes }) => {
                 let result = self
                     .restore_execution_state(&bytes)
@@ -2253,6 +2328,16 @@ impl Vcpu {
                 self.response_sender
                     .send(VcpuResponse::StateCaptured { request_id, result })
                     .expect("failed to send captured vCPU state");
+                StateMachine::next(Self::paused)
+            }
+            #[cfg(target_arch = "x86_64")]
+            Ok(VcpuEvent::ValidateState { request_id, bytes }) => {
+                let result = self
+                    .validate_execution_restore(&bytes)
+                    .map_err(|error| error.to_string());
+                self.response_sender
+                    .send(VcpuResponse::StateValidated { request_id, result })
+                    .expect("failed to send validation response");
                 StateMachine::next(Self::paused)
             }
             Ok(VcpuEvent::RestoreState { request_id, bytes }) => {
@@ -2426,7 +2511,10 @@ pub struct VcpuState {
 
 #[cfg(target_arch = "x86_64")]
 impl VcpuState {
-    fn encode_execution_payload(&self, nested: Option<&[u8]>) -> Result<Vec<u8>> {
+    fn encode_execution_payload(
+        &self,
+        nested: Option<&super::nested_state::Snapshot>,
+    ) -> Result<Vec<u8>> {
         let config = bincode::config::standard();
         match nested {
             Some(nested) => bincode::serde::encode_to_vec(&(self, nested), config),
@@ -2435,9 +2523,12 @@ impl VcpuState {
         .map_err(|error| Error::StateCodec(error.to_string()))
     }
 
-    fn decode_execution_payload(bytes: &[u8], nested: bool) -> Result<(Self, Option<Vec<u8>>)> {
+    fn decode_execution_payload(
+        bytes: &[u8],
+        nested: bool,
+    ) -> Result<(Self, Option<super::nested_state::Snapshot>)> {
         if nested {
-            let ((state, nested), consumed): ((Self, Vec<u8>), usize) =
+            let ((state, nested), consumed): ((Self, super::nested_state::Snapshot), usize) =
                 bincode::serde::decode_from_slice(
                     bytes,
                     bincode::config::standard().with_limit::<{ 16 * 1024 * 1024 }>(),
@@ -2460,7 +2551,7 @@ impl VcpuState {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct KvmCpuidEntryState {
     function: u32,
     index: u32,
@@ -2556,6 +2647,14 @@ pub enum VcpuEvent {
         /// Correlates this command with its response.
         request_id: VcpuControlRequestId,
     },
+    /// Validate a nested restore without changing backend state.
+    #[cfg(target_arch = "x86_64")]
+    ValidateState {
+        /// Correlates this command with its response.
+        request_id: VcpuControlRequestId,
+        /// Incoming execution payload.
+        bytes: Vec<u8>,
+    },
     /// Restore backend state on the owning paused vCPU thread.
     RestoreState {
         /// Correlates this command with its response.
@@ -2584,6 +2683,14 @@ pub enum VcpuResponse {
         request_id: VcpuControlRequestId,
         /// Encoded state or the backend failure.
         result: std::result::Result<Vec<u8>, String>,
+    },
+    /// Read-only restore preflight result.
+    #[cfg(target_arch = "x86_64")]
+    StateValidated {
+        /// Request acknowledged by this response.
+        request_id: VcpuControlRequestId,
+        /// Validation result.
+        result: std::result::Result<(), String>,
     },
     /// Backend state restored on the vCPU thread.
     StateRestored {
@@ -2728,7 +2835,10 @@ mod tests {
         assert!(nested.is_none());
         assert_eq!(ordinary.regs.rip, 0x1234);
 
-        let nested = vec![0x5a; 128];
+        let nested = super::super::nested_state::Snapshot {
+            state: vec![0x5a; 128],
+            feature_msrs: vec![(0x480, 0x1234)],
+        };
         let payload = state.encode_execution_payload(Some(&nested)).unwrap();
         let (restored, restored_nested) =
             VcpuState::decode_execution_payload(&payload, true).unwrap();
@@ -2749,7 +2859,10 @@ mod tests {
         // A valid but oversized vector must fail the decoder's allocation bound,
         // rather than merely failing because input is truncated.
         let oversized = state
-            .encode_execution_payload(Some(&vec![0; 16 * 1024 * 1024]))
+            .encode_execution_payload(Some(&super::super::nested_state::Snapshot {
+                state: vec![0; 16 * 1024 * 1024],
+                feature_msrs: vec![],
+            }))
             .unwrap();
         let error = VcpuState::decode_execution_payload(&oversized, true)
             .err()
