@@ -117,9 +117,14 @@ The public guard stays closed until interrupt progress also survives restore.
 
 ## macOS native qualification
 
-On Apple M5 Pro with macOS 26.5.1 (25F80), the framework advertises EL2 and the
-native probe executes an EL2 counter. Production CPU capture then fails at
-`MDCR_EL2` with `HV_BAD_ARGUMENT` (`0xfae94003`). Fresh-VM restore is not reached.
-The probe in `tests/nested-restore-hvf` preserves this failure and rejects watchdog
-cancellation as successful execution. No register is omitted, and nested snapshot
-admission remains closed. This probe is smaller than a running inner-VM test.
+On Apple M5 Pro with macOS 26.5.1 (25F80), production CPU/GIC capture and two
+independent fresh-VM restores pass in the native EL2 counter probe. Recapturing
+a restored VM and restoring that state again also passes. The earlier MDCR_EL2
+failure came from an obsolete SDK encoding; it was not an unavailable API.
+Capture also now uses ICH_VTR_EL2's implemented list-register count (eight on
+this host), and restore checks the destination inventory before writing CPU state.
+
+The probe in `tests/nested-restore-hvf` rejects watchdog cancellation as successful
+execution. It does not exercise a running inner VM, nested interrupt delivery,
+or full sandbox recovery. Nested snapshot admission remains closed until those
+cases are qualified.
