@@ -102,15 +102,21 @@ The draft backend requests WHP's bounded opaque NestedState blob alongside its e
 CPU state, retains ordinary ABI 1 payloads, and uses ABI 2 for nested payloads. Restore
 installs nested state before APIC/SynIC state. Missing nested state is an error.
 
-The VMM gate remains closed. Active nested restore ordering, destination VMX/SVM
-compatibility, and repeated fresh-partition restore still require native qualification.
+The VMM gate remains closed. Intel nested restore ordering and destination VMX/SVM
+compatibility still require native qualification.
 This layer does not add Windows ARM support or claim that the ARM API has the same state type.
 
 
-On 2026-10-13 the AMD Windows Server 2025 host passed diagnostic capture of a
-running KVM child. Fresh-process restore retained the workload identity and
-counter progress, but PIT interrupts stopped after one more tick. The inner IF
-flag remained set and PIC IRR/ISR were empty. Reapplying the outer APIC state
-after resuming partition time did not repair the failure; restoring NestedState
-before ordinary registers was rejected by WHP. Neither experiment is committed.
-The public guard stays closed until interrupt progress also survives restore.
+On 2026-10-13 the AMD Windows Server 2025 host captured a running KVM child,
+but the initial restore lost timer interrupts despite continuing counter progress.
+The outer CPU 0 APIC timer expired without a pending or in-service interrupt;
+CPU 1 and the guest clock continued. Loading WHP NestedState overwrote the
+previously restored interrupt state. Reapplying the captured interrupt state
+after NestedState restored timer delivery from the same failing snapshot.
+
+The corrected diagnostic build passed fresh-process restore, two concurrent
+restores from a new baseline, and repeated recapture/restore generations while
+preserving workload identity and both counter and PIT interrupt progress.
+The ordinary build still rejects nested capture. These results do not qualify
+Intel Windows, other nested interrupt workloads, cross-host migration or sandbox
+filesystem recovery; the public guard remains closed.

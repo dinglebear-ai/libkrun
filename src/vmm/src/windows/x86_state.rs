@@ -167,7 +167,23 @@ pub(super) fn restore_cpu(
     // Nested control state is separate from registers and XSAVE. Keep it ahead
     // of interrupt-controller restoration; live Intel/AMD qualification is required.
     if let Some(nested) = nested {
+        let interrupt_state = state
+            .registers
+            .iter()
+            .find(|(name, _)| *name == WHvRegisterInterruptState)
+            .ok_or_else(|| codec("missing WHP interrupt state"))?;
+
         super::set_virtual_processor_state(partition, id, NESTED_STATE, &nested)?;
+
+        // Loading NestedState can overwrite interrupt state restored with the ordinary
+        // registers. Reapply the captured value before APIC state so an active nested
+        // vCPU can continue receiving the outer guest's timer interrupts.
+        super::set_vcpu_registers(
+            partition,
+            cpu,
+            &[WHvRegisterInterruptState],
+            &[super::register_value_from_bytes(&interrupt_state.1)],
+        )?;
     }
     super::set_virtual_processor_state(
         partition,
