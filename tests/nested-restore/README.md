@@ -114,3 +114,21 @@ The guest prints KVM internal-error data and its kernel log on failure.
 
 These passes do not qualify a full inner operating system, filesystem recovery
 or cross-host migration. The public nested-snapshot guard remains closed.
+
+## ARM64 on Linux
+
+The draft Linux ARM64 backend also preserves the EL2 physical and virtual timers
+and the nested VGIC CPU interface (ICH list, active-priority and control registers).
+These VGIC registers are exported through the device API, not KVM_GET_REG_LIST.
+All four timers remain disabled behind the pause barrier and resume against the
+saved VM-wide counter offsets. Nested artifacts use backend ABI 2; ordinary ARM64
+artifacts keep ABI 1 and their existing layout.
+
+The current configuration requests VHE EL2 through KVM_ARM_VCPU_HAS_EL2. It requires
+a kernel and CPU that expose this capability, both EL2 timer pairs, and the nested
+VGIC register interface. Missing state is an error. Register inventories are
+checked on every owning vCPU before execution-state restoration begins.
+
+This code has cross-compilation and ARM-emulated codec/order checks only. Native
+Linux ARM64 capture, restore, forks and repeated generations remain required;
+emulation is not KVM qualification. The public nested-snapshot guard stays closed.

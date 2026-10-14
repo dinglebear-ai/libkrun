@@ -22,6 +22,11 @@ const VT_CONTROL: u64 = SYSREG | 0xdf19;
 const PT_COUNT: u64 = SYSREG | 0xdf01;
 const PT_COMPARE: u64 = SYSREG | 0xdf12;
 const PT_CONTROL: u64 = SYSREG | 0xdf11;
+const HCR: u64 = SYSREG | 0xe088;
+const HVT_COMPARE: u64 = SYSREG | 0xe71a;
+const HVT_CONTROL: u64 = SYSREG | 0xe719;
+const HPT_COMPARE: u64 = SYSREG | 0xe712;
+const HPT_CONTROL: u64 = SYSREG | 0xe711;
 const MAX_REGISTERS: usize = 8192;
 const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 // _IOW(KVMIO, 0xab/0xac, struct kvm_one_reg), Linux ARM64 UAPI.
@@ -34,7 +39,10 @@ const GET_REG_LIST: libc::c_ulong = 0xc008_aeb0;
 //--------------------------------------------------------------------------------------------------
 
 /// A duplicated vCPU descriptor used only behind the completed pause barrier.
-pub(super) struct VcpuControl(OwnedFd);
+pub(super) struct VcpuControl {
+    fd: OwnedFd,
+    nested: bool,
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(super) struct ClockState {
@@ -45,6 +53,15 @@ pub(super) struct ClockState {
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct TimerState {
+    virtual_compare: u64,
+    virtual_control: u64,
+    physical_compare: u64,
+    physical_control: u64,
+    hypervisor: Option<HypervisorTimers>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HypervisorTimers {
     virtual_compare: u64,
     virtual_control: u64,
     physical_compare: u64,
@@ -78,11 +95,14 @@ struct ExceptionState {
 //--------------------------------------------------------------------------------------------------
 
 impl VcpuControl {
-    pub fn duplicate(vcpu: &VcpuFd) -> Result<Self> {
+    pub fn duplicate(vcpu: &VcpuFd, nested: bool) -> Result<Self> {
         // Borrow only long enough to duplicate; the owned descriptor remains
         // valid independently of worker shutdown and does not expose KVM_RUN.
         let borrowed = unsafe { BorrowedFd::borrow_raw(vcpu.as_raw_fd()) };
-        borrowed.try_clone_to_owned().map(Self).map_err(codec)
+        Ok(Self {
+            fd: borrowed.try_clone_to_owned().map_err(codec)?,
+            nested,
+        })
     }
 
     pub fn read(&self, id: u64) -> Result<u64> {
@@ -91,7 +111,7 @@ impl VcpuControl {
             id,
             addr: &mut value as *mut u64 as u64,
         };
-        let result = unsafe { libc::ioctl(self.0.as_raw_fd(), GET_ONE_REG as _, &reg) };
+        let result = unsafe { libc::ioctl(self.fd.as_raw_fd(), GET_ONE_REG as _, &reg) };
         if result < 0 {
             return Err(codec(format!(
                 "read register {id:#x}: {}",
@@ -106,7 +126,7 @@ impl VcpuControl {
             id,
             addr: &value as *const u64 as u64,
         };
-        let result = unsafe { libc::ioctl(self.0.as_raw_fd(), SET_ONE_REG as _, &reg) };
+        let result = unsafe { libc::ioctl(self.fd.as_raw_fd(), SET_ONE_REG as _, &reg) };
         if result < 0 {
             return Err(codec(format!(
                 "write register {id:#x}: {}",
@@ -138,12 +158,26 @@ impl PausedState {
                 virtual_control: cpu.read(VT_CONTROL)? & 3,
                 physical_compare: cpu.read(PT_COMPARE)?,
                 physical_control: cpu.read(PT_CONTROL)? & 3,
+                hypervisor: if cpu.nested {
+                    Some(HypervisorTimers {
+                        virtual_compare: cpu.read(HVT_COMPARE)?,
+                        virtual_control: cpu.read(HVT_CONTROL)? & 3,
+                        physical_compare: cpu.read(HPT_COMPARE)?,
+                        physical_control: cpu.read(HPT_CONTROL)? & 3,
+                    })
+                } else {
+                    None
+                },
             });
         }
         for handle in handles {
             let cpu = handle.arm_control()?;
             cpu.write(VT_CONTROL, 0)?;
             cpu.write(PT_CONTROL, 0)?;
+            if cpu.nested {
+                cpu.write(HVT_CONTROL, 0)?;
+                cpu.write(HPT_CONTROL, 0)?;
+            }
         }
         Ok(Self { clock, timers })
     }
@@ -165,6 +199,15 @@ impl PausedState {
         first.write(PT_COUNT, self.clock.physical_count)?;
         for (handle, timer) in handles.iter().zip(&self.timers) {
             let cpu = handle.arm_control()?;
+            if cpu.nested != timer.hypervisor.is_some() {
+                return Err(codec("nested timer topology mismatch"));
+            }
+            if let Some(hypervisor) = timer.hypervisor {
+                cpu.write(HVT_COMPARE, hypervisor.virtual_compare)?;
+                cpu.write(HPT_COMPARE, hypervisor.physical_compare)?;
+                cpu.write(HVT_CONTROL, hypervisor.virtual_control)?;
+                cpu.write(HPT_CONTROL, hypervisor.physical_control)?;
+            }
             cpu.write(VT_COMPARE, timer.virtual_compare)?;
             cpu.write(PT_COMPARE, timer.physical_compare)?;
             cpu.write(VT_CONTROL, timer.virtual_control)?;
@@ -223,6 +266,10 @@ pub(super) fn complete_capture(bytes: &[u8], paused: &PausedState, id: usize) ->
             PT_COMPARE => Some(timer.physical_compare),
             VT_CONTROL => Some(timer.virtual_control),
             PT_CONTROL => Some(timer.physical_control),
+            HVT_COMPARE => timer.hypervisor.map(|timer| timer.virtual_compare),
+            HPT_COMPARE => timer.hypervisor.map(|timer| timer.physical_compare),
+            HVT_CONTROL => timer.hypervisor.map(|timer| timer.virtual_control),
+            HPT_CONTROL => timer.hypervisor.map(|timer| timer.physical_control),
             _ => None,
         };
         if let Some(saved) = saved {
@@ -249,10 +296,20 @@ pub(super) fn stage_timer(bytes: &[u8]) -> Result<TimerState> {
         virtual_control: get(VT_CONTROL)? & 3,
         physical_compare: get(PT_COMPARE)?,
         physical_control: get(PT_CONTROL)? & 3,
+        hypervisor: if state.registers.iter().any(|(id, _)| *id == HCR) {
+            Some(HypervisorTimers {
+                virtual_compare: get(HVT_COMPARE)?,
+                virtual_control: get(HVT_CONTROL)? & 3,
+                physical_compare: get(HPT_COMPARE)?,
+                physical_control: get(HPT_CONTROL)? & 3,
+            })
+        } else {
+            None
+        },
     })
 }
 
-pub(super) fn restore_cpu(fd: &VcpuFd, bytes: &[u8]) -> Result<()> {
+pub(super) fn validate_cpu(fd: &VcpuFd, bytes: &[u8]) -> Result<()> {
     let state = decode_cpu(bytes)?;
     let ids = register_ids(fd)?;
     if ids
@@ -264,12 +321,29 @@ pub(super) fn restore_cpu(fd: &VcpuFd, bytes: &[u8]) -> Result<()> {
     {
         return Err(codec("ARM64 register contract differs from destination"));
     }
+    // Require all exported timer state before touching the destination.
+    stage_timer(bytes)?;
+    Ok(())
+}
+
+pub(super) fn restore_cpu(fd: &VcpuFd, bytes: &[u8]) -> Result<()> {
+    validate_cpu(fd, bytes)?;
+    let state = decode_cpu(bytes)?;
+    if state.registers.iter().any(|(id, _)| *id == HCR) {
+        fd.set_one_reg(HVT_CONTROL, &0_u64.to_le_bytes())
+            .map_err(codec)?;
+        fd.set_one_reg(HPT_CONTROL, &0_u64.to_le_bytes())
+            .map_err(codec)?;
+    }
     fd.set_one_reg(VT_CONTROL, &0_u64.to_le_bytes())
         .map_err(codec)?;
     fd.set_one_reg(PT_CONTROL, &0_u64.to_le_bytes())
         .map_err(codec)?;
     for (id, value) in state.registers {
-        if matches!(id, VT_COUNT | PT_COUNT | VT_CONTROL | PT_CONTROL) {
+        if matches!(
+            id,
+            VT_COUNT | PT_COUNT | VT_CONTROL | PT_CONTROL | HVT_CONTROL | HPT_CONTROL
+        ) {
             continue;
         }
         if let Err(error) = fd.set_one_reg(id, &value) {
@@ -393,40 +467,64 @@ mod tests {
 
     #[test]
     fn capture_uses_frozen_clocks_and_original_timer_controls() {
-        let paused = PausedState {
-            clock: ClockState {
-                virtual_count: 10,
-                physical_count: 20,
-                frequency: 24_000_000,
-            },
-            timers: vec![TimerState {
-                virtual_compare: 30,
-                virtual_control: 3,
-                physical_compare: 40,
-                physical_control: 1,
-            }],
-        };
-        let bytes = complete_capture(&encode(&cpu_state()).unwrap(), &paused, 0).unwrap();
-        let decoded = decode_cpu(&bytes).unwrap();
-        let get = |id| {
-            u64::from_le_bytes(
-                decoded
-                    .registers
-                    .iter()
-                    .find(|(reg, _)| *reg == id)
-                    .unwrap()
-                    .1
-                    .as_slice()
-                    .try_into()
-                    .unwrap(),
-            )
-        };
-        assert_eq!(get(VT_COUNT), 10);
-        assert_eq!(get(PT_COUNT), 20);
-        assert_eq!(stage_timer(&bytes).unwrap().virtual_control, 3);
-        assert_eq!(stage_timer(&bytes).unwrap().physical_compare, 40);
-        assert_eq!(decoded.events.serror_esr, 0x1234);
-        assert!(complete_capture(&bytes, &paused, 1).is_err());
+        for nested in [false, true] {
+            let mut state = cpu_state();
+            if nested {
+                for id in [HCR, HVT_COMPARE, HVT_CONTROL, HPT_COMPARE, HPT_CONTROL] {
+                    state.registers.push((id, 99_u64.to_le_bytes().to_vec()));
+                }
+                state.registers.sort_by_key(|(id, _)| *id);
+            }
+            let paused = PausedState {
+                clock: ClockState {
+                    virtual_count: 10,
+                    physical_count: 20,
+                    frequency: 24_000_000,
+                },
+                timers: vec![TimerState {
+                    virtual_compare: 30,
+                    virtual_control: 3,
+                    physical_compare: 40,
+                    physical_control: 1,
+                    hypervisor: nested.then_some(HypervisorTimers {
+                        virtual_compare: 50,
+                        virtual_control: 3,
+                        physical_compare: 60,
+                        physical_control: 1,
+                    }),
+                }],
+            };
+            let bytes = complete_capture(&encode(&state).unwrap(), &paused, 0).unwrap();
+            let decoded = decode_cpu(&bytes).unwrap();
+            let get = |id| {
+                u64::from_le_bytes(
+                    decoded
+                        .registers
+                        .iter()
+                        .find(|(reg, _)| *reg == id)
+                        .unwrap()
+                        .1
+                        .as_slice()
+                        .try_into()
+                        .unwrap(),
+                )
+            };
+            assert_eq!(get(VT_COUNT), 10);
+            assert_eq!(get(PT_COUNT), 20);
+            assert_eq!(stage_timer(&bytes).unwrap().virtual_control, 3);
+            assert_eq!(stage_timer(&bytes).unwrap().physical_compare, 40);
+            assert_eq!(decoded.events.serror_esr, 0x1234);
+            assert!(complete_capture(&bytes, &paused, 1).is_err());
+            if nested {
+                assert_eq!(get(HVT_COMPARE), 50);
+                assert_eq!(get(HVT_CONTROL), 3);
+                assert_eq!(get(HPT_COMPARE), 60);
+                assert_eq!(get(HPT_CONTROL), 1);
+                let hypervisor = stage_timer(&bytes).unwrap().hypervisor.unwrap();
+                assert_eq!(hypervisor.virtual_control, 3);
+                assert_eq!(hypervisor.physical_compare, 60);
+            }
+        }
     }
 
     #[test]

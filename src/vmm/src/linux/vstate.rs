@@ -1279,6 +1279,8 @@ pub struct Vcpu {
 
     #[cfg(target_arch = "aarch64")]
     mpidr: u64,
+    #[cfg(target_arch = "aarch64")]
+    nested_enabled: bool,
 
     // The receiving end of events channel owned by the vcpu side.
     event_receiver: Receiver<VcpuEvent>,
@@ -1464,6 +1466,7 @@ impl Vcpu {
             mmio_bus: None,
             exit_evt,
             mpidr: 0,
+            nested_enabled: false,
             event_receiver,
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
@@ -1648,6 +1651,7 @@ impl Vcpu {
         )
         .map_err(Error::REGSConfiguration)?;
 
+        self.nested_enabled = nested_enabled;
         self.mpidr = arch::aarch64::regs::read_mpidr(&self.fd).map_err(Error::REGSConfiguration)?;
 
         Ok(())
@@ -1676,7 +1680,7 @@ impl Vcpu {
     /// The handle can be used to control the remote vcpu.
     pub fn start_threaded(mut self) -> Result<(VcpuHandle, VcpuPlacementResult)> {
         #[cfg(target_arch = "aarch64")]
-        let control = arm64_state::VcpuControl::duplicate(&self.fd)?;
+        let control = arm64_state::VcpuControl::duplicate(&self.fd, self.nested_enabled)?;
         let event_sender = self.event_sender.take().unwrap();
         let response_receiver = self.response_receiver.take().unwrap();
         let (init_tls_sender, init_tls_receiver) = unbounded();
@@ -1896,6 +1900,11 @@ impl Vcpu {
     #[cfg(target_arch = "aarch64")]
     fn capture_execution_state(&self) -> Result<Vec<u8>> {
         arm64_state::capture_cpu(&self.fd)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn validate_execution_restore(&self, bytes: &[u8]) -> Result<()> {
+        arm64_state::validate_cpu(&self.fd, bytes)
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -2279,7 +2288,7 @@ impl Vcpu {
                     .send(VcpuResponse::StateCaptured { request_id, result })
                     .expect("failed to send captured vCPU state");
             }
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             Ok(VcpuEvent::ValidateState { request_id, .. }) => {
                 self.response_sender
                     .send(VcpuResponse::StateValidated {
@@ -2337,7 +2346,7 @@ impl Vcpu {
                     .expect("failed to send captured vCPU state");
                 StateMachine::next(Self::paused)
             }
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             Ok(VcpuEvent::ValidateState { request_id, bytes }) => {
                 let result = self
                     .validate_execution_restore(&bytes)
@@ -2655,7 +2664,7 @@ pub enum VcpuEvent {
         request_id: VcpuControlRequestId,
     },
     /// Validate a nested restore without changing backend state.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     ValidateState {
         /// Correlates this command with its response.
         request_id: VcpuControlRequestId,
@@ -2692,7 +2701,7 @@ pub enum VcpuResponse {
         result: std::result::Result<Vec<u8>, String>,
     },
     /// Read-only restore preflight result.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     StateValidated {
         /// Request acknowledged by this response.
         request_id: VcpuControlRequestId,

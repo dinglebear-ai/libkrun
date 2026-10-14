@@ -77,7 +77,12 @@ fn acknowledge_revision(fd: &DeviceFd) -> Result<(), kvm_ioctls::Error> {
     fd.set_device_attr(&attr)
 }
 
-pub(super) fn capture(fd: &DeviceFd, version: u32, mpidrs: &[u64]) -> Result<Vec<u8>, Error> {
+pub(super) fn capture(
+    fd: &DeviceFd,
+    version: u32,
+    mpidrs: &[u64],
+    nested: bool,
+) -> Result<Vec<u8>, Error> {
     if version == 3 {
         // KVM owns LPI pending bits until this flush. RAM capture follows the
         // execution-state capture, so those bytes belong to the same snapshot.
@@ -89,7 +94,7 @@ pub(super) fn capture(fd: &DeviceFd, version: u32, mpidrs: &[u64]) -> Result<Vec
         })
         .map_err(failure)?;
     }
-    let (identity, layout) = layout(fd, version, mpidrs)?;
+    let (identity, layout) = layout(fd, version, mpidrs, nested)?;
     let registers = layout
         .into_iter()
         .map(|reg| read(fd, reg).map(|value| (reg, value)))
@@ -110,6 +115,7 @@ pub(super) fn restore(
     fd: &DeviceFd,
     version: u32,
     mpidrs: &[u64],
+    nested: bool,
     bytes: &[u8],
 ) -> Result<(), Error> {
     let (state, used): (State, usize) = bincode::serde::decode_from_slice(
@@ -117,7 +123,7 @@ pub(super) fn restore(
         bincode::config::standard().with_limit::<MAX_STATE_BYTES>(),
     )
     .map_err(failure)?;
-    let (identity, layout) = layout(fd, version, mpidrs)?;
+    let (identity, layout) = layout(fd, version, mpidrs, nested)?;
     if used != bytes.len()
         || state.version != version
         || state.mpidrs != mpidrs
@@ -177,7 +183,12 @@ fn restore_registers(
     Ok(())
 }
 
-fn layout(fd: &DeviceFd, version: u32, mpidrs: &[u64]) -> Result<(Vec<u64>, Vec<Register>), Error> {
+fn layout(
+    fd: &DeviceFd,
+    version: u32,
+    mpidrs: &[u64],
+    nested: bool,
+) -> Result<(Vec<u64>, Vec<Register>), Error> {
     // VGICv2 lacks the line-level state interface: inventing pending latches
     // from its combined pending bitmap would not preserve interrupt semantics.
     if mpidrs.is_empty() || mpidrs.len() > 255 || version != 3 {
@@ -270,6 +281,50 @@ fn layout(fd: &DeviceFd, version: u32, mpidrs: &[u64]) -> Result<(Vec<u64>, Vec<
                     attr: affinity | (0xc648 + word),
                 });
             }
+            if nested {
+                // EL2 interrupt state is absent from KVM_GET_REG_LIST. KVM
+                // exposes it only through the VGIC CPU_SYSREGS device group.
+                let vtr = read(
+                    fd,
+                    Register {
+                        group: CPU,
+                        attr: affinity | 0xe659,
+                    },
+                )?;
+                let sre = read(
+                    fd,
+                    Register {
+                        group: CPU,
+                        attr: affinity | 0xe64d,
+                    },
+                )?;
+                let list_count = (vtr & 0x1f) + 1;
+                let priority_bits = ((vtr >> 29) & 7) + 1;
+                if list_count > 16 || !(5..=7).contains(&priority_bits) {
+                    return Err(failure("unsupported nested VGIC inventory"));
+                }
+                identity.extend([vtr, sre]);
+                for word in 0..(1 << (priority_bits - 5)) {
+                    for offset in [0xe640, 0xe648] {
+                        regs.push(Register {
+                            group: CPU,
+                            attr: affinity | (offset + word),
+                        });
+                    }
+                }
+                for word in 0..list_count {
+                    regs.push(Register {
+                        group: CPU,
+                        attr: affinity | (0xe660 + word),
+                    });
+                }
+                for offset in [0xe65f, 0xe658] {
+                    regs.push(Register {
+                        group: CPU,
+                        attr: affinity | offset,
+                    });
+                }
+            }
             // CPU group enables and redistributor LPI enable follow all state.
             for offset in [0xc666, 0xc667] {
                 regs.push(Register {
@@ -334,7 +389,7 @@ fn is_activation(reg: Register) -> bool {
     let offset = reg.attr as u32;
     is_enable(reg)
         || (matches!(reg.group, DIST | REDIST | KVM_DEV_ARM_VGIC_GRP_CPU_REGS) && offset == 0)
-        || (reg.group == CPU && matches!(offset, 0xc666 | 0xc667))
+        || (reg.group == CPU && matches!(offset, 0xc666 | 0xc667 | 0xe658))
 }
 
 fn read(fd: &DeviceFd, reg: Register) -> Result<u64, Error> {
@@ -406,8 +461,23 @@ mod tests {
             group: LEVEL,
             attr: 0,
         };
-        // Match capture layout: distributor control is serialized last.
-        let registers = [(enable, 1 << 27), (level, 1 << 27), (distributor, 0x52)];
+        let nested_enable = Register {
+            group: CPU,
+            attr: 0xe658,
+        };
+        let nested_interrupt = Register {
+            group: CPU,
+            attr: 0xe660,
+        };
+        // Enables must follow pending state even when they appear earlier in
+        // the snapshot. The distributor itself is restored before either.
+        let registers = [
+            (enable, 1 << 27),
+            (nested_enable, 1),
+            (level, 1 << 27),
+            (nested_interrupt, 0x1234),
+            (distributor, 0x52),
+        ];
         let mut writes = Vec::new();
         restore_registers(&registers, |reg, value| {
             writes.push((reg, value));
@@ -426,7 +496,9 @@ mod tests {
                 ),
                 (distributor, 0x52),
                 (level, 1 << 27),
+                (nested_interrupt, 0x1234),
                 (enable, 1 << 27),
+                (nested_enable, 1),
             ]
         );
     }
