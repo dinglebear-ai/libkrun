@@ -51,6 +51,11 @@ select `TEST_SPLIT_IRQCHIP=true` in this harness to match that setting. Changing
 it alone has not resolved the standalone RAM-root fixture's early boot delay on
 the AMD cloud host, so keep its results separate from the runtime's. Disabling
 HPET in the inner guest avoids the observed delay, but is not required by the
-tested Microsandbox configuration.
+tested Microsandbox configuration. A fresh AMD host subsequently passed the full
+standalone matrix with default inner guest settings under both outer interrupt
+controller profiles. Initial capture took 79 seconds with split IRQ and 196
+seconds with full IRQ, using a 900-second initial progress deadline. The sustained
+ten-second progress check was unchanged. This confirms that the earlier
+180-second boot timeout can be intermittent; it does not resolve its cause.
 Linux ARM64, Intel Windows and Windows ARM64 still need native qualification.
 The public nested-snapshot guard remains closed.
