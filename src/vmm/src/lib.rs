@@ -451,6 +451,9 @@ fn current_execution_backend_state_abi(nested_enabled: bool) -> u32 {
     if cfg!(all(target_os = "linux", target_arch = "x86_64")) && nested_enabled {
         // ABI 3 binds the nested-state blob to the source KVM feature MSRs.
         3
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) && nested_enabled {
+        // EL2 timers and the nested VGIC CPU interface are mandatory.
+        2
     } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) && nested_enabled {
         // WHP nested payloads append the backend state blob to ordinary CPU state.
         2
@@ -1437,7 +1440,7 @@ impl Vmm {
                 .map_err(|_| {
                     Error::ExecutionStateBackend("interrupt controller mutex is poisoned".into())
                 })?
-                .capture_arm_state(&mpidrs)
+                .capture_arm_state(&mpidrs, self.nested_enabled)
                 .map_err(|error| Error::ExecutionStateBackend(format!("{error:?}")))?;
             let vm = self.vm.capture_execution_state().map_err(Error::Vm)?;
             bincode::serde::encode_to_vec(
@@ -1509,7 +1512,10 @@ impl Vmm {
             return Err(Error::ExecutionStateTopologyMismatch);
         }
 
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
         if self.nested_enabled {
             let request_id = self.next_control_request_id()?;
             for (handle, vcpu) in self.vcpus_handles.iter().zip(state.vcpus()) {
@@ -1606,7 +1612,7 @@ impl Vmm {
                 .map_err(|_| {
                     Error::ExecutionStateBackend("interrupt controller mutex is poisoned".into())
                 })?
-                .restore_arm_state(&mpidrs, &backend.gic)
+                .restore_arm_state(&mpidrs, self.nested_enabled, &backend.gic)
                 .map_err(|error| Error::ExecutionStateBackend(format!("{error:?}")))?;
         }
         #[cfg(all(target_os = "windows", target_arch = "x86_64"))]

@@ -80,12 +80,17 @@ impl KvmGicV3 {
 }
 
 impl IrqChipT for KvmGicV3 {
-    fn capture_arm_state(&self, mpidrs: &[u64]) -> Result<Vec<u8>, DeviceError> {
-        super::kvmgic_state::capture(&self._device_fd, 3, mpidrs)
+    fn capture_arm_state(&self, mpidrs: &[u64], nested: bool) -> Result<Vec<u8>, DeviceError> {
+        super::kvmgic_state::capture(&self._device_fd, 3, mpidrs, nested)
     }
 
-    fn restore_arm_state(&mut self, mpidrs: &[u64], bytes: &[u8]) -> Result<(), DeviceError> {
-        super::kvmgic_state::restore(&self._device_fd, 3, mpidrs, bytes)
+    fn restore_arm_state(
+        &mut self,
+        mpidrs: &[u64],
+        nested: bool,
+        bytes: &[u8],
+    ) -> Result<(), DeviceError> {
+        super::kvmgic_state::restore(&self._device_fd, 3, mpidrs, nested, bytes)
     }
 
     fn get_mmio_addr(&self) -> u64 {
