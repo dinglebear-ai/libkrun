@@ -775,6 +775,8 @@ pub struct VcpuHandle {
 #[derive(Default)]
 struct Partition {
     handle: WHV_PARTITION_HANDLE,
+    #[cfg(target_arch = "x86_64")]
+    nested_enabled: bool,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1161,12 +1163,17 @@ impl Vm {
         id: u32,
         _worker_bytes: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        x86_state::capture_cpu(self.partition.handle, id)
+        x86_state::capture_cpu(self.partition.handle, id, self.partition.nested_enabled)
     }
 
     #[cfg(target_arch = "x86_64")]
     pub fn prepare_vcpu_execution_restore(&self, id: u32, bytes: &[u8]) -> Result<Vec<u8>> {
-        x86_state::restore_cpu(self.partition.handle, id, bytes)?;
+        x86_state::restore_cpu(
+            self.partition.handle,
+            id,
+            bytes,
+            self.partition.nested_enabled,
+        )?;
         Ok(Vec::new())
     }
 
@@ -1902,7 +1909,11 @@ impl Partition {
             return Err(Error::CreatePartition(hresult));
         }
 
-        let partition = Self { handle };
+        let partition = Self {
+            handle,
+            #[cfg(target_arch = "x86_64")]
+            nested_enabled,
+        };
         partition.set_processor_count(vcpu_count)?;
         if nested_enabled {
             partition.enable_nested_virt()?;

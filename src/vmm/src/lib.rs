@@ -451,6 +451,9 @@ fn current_execution_backend_state_abi(nested_enabled: bool) -> u32 {
     if cfg!(all(target_os = "linux", target_arch = "x86_64")) && nested_enabled {
         // ABI 3 binds the nested-state blob to the source KVM feature MSRs.
         3
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) && nested_enabled {
+        // WHP nested payloads append the backend state blob to ordinary CPU state.
+        2
     } else {
         1
     }

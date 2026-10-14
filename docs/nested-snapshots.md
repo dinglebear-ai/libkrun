@@ -95,3 +95,28 @@ incompatible-feature rejection and bounded codec checks also passed.
 These diagnostic results do not qualify AMD Linux, broader interrupt workloads,
 cross-host migration or sandbox filesystem recovery. Complete those checks and
 review each vendor's active nested restore ordering before opening admission.
+
+## Windows x86 implementation status
+
+The draft backend requests WHP's bounded opaque NestedState blob alongside its existing
+CPU state, retains ordinary ABI 1 payloads, and uses ABI 2 for nested payloads. Restore
+installs nested state before APIC/SynIC state. Missing nested state is an error.
+
+The VMM gate remains closed. Intel nested restore ordering and destination VMX/SVM
+compatibility still require native qualification.
+This layer does not add Windows ARM support or claim that the ARM API has the same state type.
+
+
+On 2026-10-13 the AMD Windows Server 2025 host captured a running KVM child,
+but the initial restore lost timer interrupts despite continuing counter progress.
+The outer CPU 0 APIC timer expired without a pending or in-service interrupt;
+CPU 1 and the guest clock continued. Loading WHP NestedState overwrote the
+previously restored interrupt state. Reapplying the captured interrupt state
+after NestedState restored timer delivery from the same failing snapshot.
+
+The corrected diagnostic build passed fresh-process restore, two concurrent
+restores from a new baseline, and repeated recapture/restore generations while
+preserving workload identity and both counter and PIT interrupt progress.
+The ordinary build still rejects nested capture. These results do not qualify
+Intel Windows, other nested interrupt workloads, cross-host migration or sandbox
+filesystem recovery; the public guard remains closed.
