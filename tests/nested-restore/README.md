@@ -34,7 +34,9 @@ marker after ten seconds of advancing counter and interrupt samples as well as
 exit code zero. The observation window restarts on stalled progress; guest shutdown
 before the controller finishes is a failure.
 
-The fixture has no persistent guest disk or host filesystem mount. CPU, guest
+For a complete Linux guest with an ext4 workload, use the [full-OS fixture](os/README.md).
+
+The counter fixture has no persistent guest disk or host filesystem mount. CPU, guest
 memory and supported virtio device states are captured through production APIs.
 It does not qualify sandbox filesystem recovery or CPU migration across hosts.
 

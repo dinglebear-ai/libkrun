@@ -48,6 +48,9 @@ impl VmMemoryRestoreSource for Memory {
 }
 fn progress(path: &std::path::Path) -> Option<(u32, u32, u64)> {
     let text = fs::read_to_string(path).ok()?;
+    // Console writes can split a decimal identity at any digit. Ignore the
+    // unfinished record so a partial number cannot look like a cold reboot.
+    let (text, _) = text.rsplit_once('\n')?;
     text.lines().rev().find_map(|line| {
         let mut fields = line.strip_prefix("NESTED_PROGRESS ")?.split_whitespace();
         Some((
@@ -68,6 +71,18 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    let memory_mib = std::env::var("TEST_MEMORY_MIB")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(256);
+    let progress_timeout = Duration::from_secs(
+        std::env::var("TEST_PROGRESS_TIMEOUT_SECONDS")
+            .ok()
+            .map(|value| value.parse::<u64>())
+            .transpose()?
+            .unwrap_or(30),
+    );
     fs::write(root.join("console.log"), "")?;
     let mut vm = VmBuilder::new()
         .on_exit(|code| {
@@ -76,7 +91,7 @@ fn main() -> Result<()> {
         })
         .machine(|m| {
             m.vcpus(2)
-                .memory_mib(256)
+                .memory_mib(memory_mib)
                 .nested_virt(true)
                 .balloon(false)
                 .rng(false)
@@ -121,7 +136,7 @@ fn main() -> Result<()> {
             let mut previous = None;
             let mut progress_started = None;
             loop {
-                if begin.elapsed() > Duration::from_secs(30) {
+                if begin.elapsed() > progress_timeout {
                     return Err("inner counter/timer did not progress".into());
                 }
                 if let Some(current) = progress(&root.join("console.log")) {
@@ -189,4 +204,35 @@ fn main() -> Result<()> {
     });
     vm.enter()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_waits_for_a_complete_console_record() {
+        let path = std::env::temp_dir().join(format!(
+            "nested-progress-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::write(
+            &path,
+            "NESTED_PROGRESS 1 10 123456\nNESTED_PROGRESS 2 20 123",
+        )
+        .unwrap();
+        let partial = progress(&path);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"456\n")
+            .unwrap();
+        let complete = progress(&path);
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(partial, Some((1, 10, 123456)));
+        assert_eq!(complete, Some((2, 20, 123456)));
+    }
 }
