@@ -140,7 +140,12 @@ one baseline passed, as did a separate chain of four successive restores.
 That workload exposed a restore-order defect: installing the HVF clock offset
 after timer registers could stall a recaptured VM. Installing the offset first
 resumed the same saved failing snapshot, without discarding clock rebasing.
-However, another recaptured snapshot reproducibly exits KVM with an internal
-error. Subsequent successful runs do not resolve that remaining failure.
+Two further saved failures required initializing the fresh vCPU at EL2 before
+restoring its saved mode, and rearming the framework's timer notifications. A
+parent captured at EL1 otherwise returned NOT_SUPPORTED from its next nested
+hypercall; retaining the old notification mask caused bursty timer progress.
+Both exact artifacts now pass the sustained-progress check. Architectural timer
+and GIC state are restored; only the nested framework notification mask is reset.
+Fresh capture, concurrent restores and repeated recapture/restore also pass.
 Nested snapshot admission stays closed. This fixture does not qualify a full
 inner operating system, sandbox filesystem recovery or cross-host migration.

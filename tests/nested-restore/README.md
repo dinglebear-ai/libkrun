@@ -83,7 +83,14 @@ be installed before the saved timer registers so deadlines use the restored cloc
 On 2026-10-13, Apple M5 Pro with macOS 26.5.1 passed diagnostic capture,
 two concurrent restores from one baseline and a separate chain of four successive
 restores. The same saved second-generation snapshot that stalled with the old
-clock ordering resumed after the ordering fix. Another recaptured snapshot
-reproducibly returned `KVM_EXIT_INTERNAL_ERROR`; this remains unresolved, so
-these passes do not qualify public nested snapshots. The guest prints the KVM
-internal-error data and kernel log on failure to support further investigation.
+clock ordering resumed after the ordering fix. Two additional saved artifacts
+exposed an internal error when the parent was captured at EL1, and bursty progress with an expired, notification-masked timer.
+Initializing the fresh CPU at EL2 before restoring its saved mode and rearming
+nested timer notifications fixed both exact reproductions. Fresh capture,
+concurrent restores and repeated recapture/restore pass the strict ten-second
+progress check. Preserve captures from the parent at EL1 and from EL2 timer
+handling: a chain that only stops the child in its counter loop misses these cases.
+The guest prints KVM internal-error data and its kernel log on failure.
+
+These passes do not qualify a full inner operating system, filesystem recovery
+or cross-host migration. The public nested-snapshot guard remains closed.

@@ -30,5 +30,6 @@ result only advertises execution support; it does not establish snapshot support
 
 For the running KVM child and timer-interrupt fixture, see
 [`../nested-restore`](../nested-restore/README.md). Its later qualification found
-a clock restore-order defect and a separate, still unresolved KVM internal error.
+clock ordering, fresh-CPU EL2 initialization and timer-notification rearming
+defects that the smaller probe does not reproduce.
 The smaller EL2 probe passing is not sufficient to open snapshot admission.

@@ -939,6 +939,13 @@ impl HvfVcpu<'_> {
         }
         gic_registers::get().require(self.nested_enabled)?;
 
+        if self.nested_enabled {
+            // Initialize HVF's nested execution context before restoring the saved mode.
+            // A snapshot may stop the parent kernel at EL1; starting a fresh vCPU there
+            // directly can make its next EL2 hypercall return NOT_SUPPORTED.
+            self.write_reg(hv_reg_t_HV_REG_CPSR, PSTATE_EL2_FAULT_BITS_64)?;
+        }
+
         // Establish the restored clock before programming timer deadlines. HVF does not
         // reliably rearm nested physical timers when the offset changes afterward.
         if unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, state.vtimer_offset) } != HV_SUCCESS {
@@ -968,11 +975,16 @@ impl HvfVcpu<'_> {
         }
         vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, state.pending_irq)?;
         vcpu_set_pending_irq(self.vcpuid, InterruptType::Fiq, state.pending_fiq)?;
-        vcpu_set_vtimer_mask(self.vcpuid, state.vtimer_mask)?;
+
+        // This mask suppresses framework notifications, not the guest timer interrupt.
+        // Rearm notifications in a fresh nested context: carrying over a masked exit
+        // can strand an expired timer. Architectural timer and GIC state stay restored.
+        let vtimer_mask = state.vtimer_mask && !self.nested_enabled;
+        vcpu_set_vtimer_mask(self.vcpuid, vtimer_mask)?;
 
         self.pending_mmio_read = None;
         self.pending_advance_pc = state.pending_advance_pc;
-        self.vtimer_masked = state.vtimer_mask;
+        self.vtimer_masked = vtimer_mask;
         Ok(())
     }
 
