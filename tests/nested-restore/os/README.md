@@ -44,6 +44,12 @@ mounts, networking, cross-host migration or the Microsandbox lifecycle API.
 
 2026-10-14 qualification: Intel Linux, AMD Windows and Apple M5 Pro macOS passed
 capture, fresh-process restore, two concurrent forks and a second snapshot
-generation. AMD Linux still stalls during full-OS boot, despite passing the
-smaller counter/PIT restore matrix. Linux ARM64, Intel Windows and Windows ARM64
-still need native qualification. The public nested-snapshot guard remains closed.
+generation. AMD Linux also passed Microsandbox's managed-disk CLI matrix,
+including archive export/import, with the default inner guest settings and no
+timer overrides. That runtime uses a split interrupt controller for the outer VM;
+select `TEST_SPLIT_IRQCHIP=true` in this harness to match it. The standalone
+fully in-kernel outer-controller profile still has early boot delays on the AMD
+cloud host, so keep its results separate. Disabling HPET in the inner guest also
+avoids that delay, but is not required by the tested Microsandbox configuration.
+Linux ARM64, Intel Windows and Windows ARM64 still need native qualification.
+The public nested-snapshot guard remains closed.

@@ -83,6 +83,15 @@ fn main() -> Result<()> {
             .transpose()?
             .unwrap_or(30),
     );
+    let split_irqchip = std::env::var("TEST_SPLIT_IRQCHIP")
+        .ok()
+        .map(|value| value.parse::<bool>())
+        .transpose()?
+        .unwrap_or(false);
+    if split_irqchip && !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return Err("TEST_SPLIT_IRQCHIP requires a Linux x86_64 host".into());
+    }
+    eprintln!("outer split irqchip: {split_irqchip}");
     fs::write(root.join("console.log"), "")?;
     let mut vm = VmBuilder::new()
         .on_exit(|code| {
@@ -93,6 +102,7 @@ fn main() -> Result<()> {
             m.vcpus(2)
                 .memory_mib(memory_mib)
                 .nested_virt(true)
+                .split_irqchip(split_irqchip)
                 .balloon(false)
                 .rng(false)
         })

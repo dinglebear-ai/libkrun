@@ -26,6 +26,13 @@ tests/nested-restore/target/debug/nested-restore-live capture
 tests/nested-restore/target/debug/nested-restore-live restore
 ```
 
+On Linux x86_64, set `TEST_SPLIT_IRQCHIP=true` to use the outer VM's split
+interrupt controller, matching Microsandbox's runtime configuration. The default
+is `false`, preserving the fully in-kernel controller as a separate test profile.
+Use the same value for capture and restore. The harness prints the selected
+profile and rejects this option on other host platforms. This controls libkrun's
+outer VM, not the `kernel_irqchip` setting of QEMU inside the guest.
+
 To capture again after restoring, set `TEST_OUTPUT_SNAPSHOT` to a new directory.
 Restore that directory in another process to check a second generation. To test
 forks, restore the same baseline into different `TEST_ROOT` directories. Do not
