@@ -47,6 +47,9 @@ int main(void) {
     close(dir);
 
     for (;;) {
+        // Verify restored disk contents before overwriting them with the next record.
+        int error = posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        if (error) { errno = error; fail("evict restored file cache"); }
         struct record actual;
         if (pread(fd, &actual, sizeof(actual), 0) != sizeof(actual)) fail("read disk");
         if (memcmp(&actual, &saved, sizeof(saved))) {
@@ -57,7 +60,7 @@ int main(void) {
         saved.check = identity ^ generation;
         if (pwrite(fd, &saved, sizeof(saved), 0) != sizeof(saved) || fsync(fd)) fail("commit disk");
         // Evict clean file pages so verification also exercises the virtual block device.
-        int error = posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        error = posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
         if (error) { errno = error; fail("evict file cache"); }
         // Read committed data again; errors must stop progress before the host accepts it.
         if (pread(fd, &actual, sizeof(actual), 0) != sizeof(actual) || memcmp(&actual, &saved, sizeof(saved))) {
