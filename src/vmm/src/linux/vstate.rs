@@ -2948,6 +2948,44 @@ mod tests {
         ));
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn nested_restore_rejects_incomplete_runtime_msr_inventory() {
+        let (_vm, mut vcpu, memory) = setup_vcpu(0x1000);
+        vcpu.configure_x86_64(
+            &memory,
+            GuestAddress(0),
+            &VcpuConfig {
+                vcpu_count: 2,
+                max_vcpu_count: 2,
+                ht_enabled: false,
+                cpu_template: None,
+                nested_enabled: true,
+            },
+            false,
+        )
+        .unwrap();
+        assert!(vcpu.nested_state_enabled());
+        let bytes = vcpu.capture_execution_state().unwrap();
+        vcpu.validate_execution_restore(&bytes).unwrap();
+
+        for duplicate in [false, true] {
+            let (mut state, nested) = VcpuState::decode_execution_payload(&bytes, true).unwrap();
+            assert!(state.msrs.len() > 1);
+            if duplicate {
+                state.msrs[1].index = state.msrs[0].index;
+            } else {
+                state.msrs.pop();
+            }
+            let malformed = state.encode_execution_payload(nested.as_ref()).unwrap();
+            let error = vcpu.validate_execution_restore(&malformed).unwrap_err();
+            assert!(
+                error.to_string().contains("runtime MSR inventory"),
+                "{error}"
+            );
+        }
+    }
+
     // Auxiliary function being used throughout the tests.
     fn setup_vcpu(mem_size: usize) -> (Vm, Vcpu, GuestMemoryMmap) {
         let kvm = KvmContext::new().unwrap();
