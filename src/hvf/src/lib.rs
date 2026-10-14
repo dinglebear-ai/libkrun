@@ -939,6 +939,12 @@ impl HvfVcpu<'_> {
         }
         gic_registers::get().require(self.nested_enabled)?;
 
+        // Establish the restored clock before programming timer deadlines. HVF does not
+        // reliably rearm nested physical timers when the offset changes afterward.
+        if unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, state.vtimer_offset) } != HV_SUCCESS {
+            return Err(Error::VcpuSetVtimerOffset);
+        }
+
         for &(register, value) in &state.general {
             self.write_reg(register, value)?;
         }
@@ -959,9 +965,6 @@ impl HvfVcpu<'_> {
         }
         for &(register, value) in &state.ich {
             self.write_ich_reg(register, value)?;
-        }
-        if unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, state.vtimer_offset) } != HV_SUCCESS {
-            return Err(Error::VcpuSetVtimerOffset);
         }
         vcpu_set_pending_irq(self.vcpuid, InterruptType::Irq, state.pending_irq)?;
         vcpu_set_pending_irq(self.vcpuid, InterruptType::Fiq, state.pending_fiq)?;

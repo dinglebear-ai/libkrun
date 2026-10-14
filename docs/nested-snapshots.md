@@ -124,7 +124,17 @@ failure came from an obsolete SDK encoding; it was not an unavailable API.
 Capture also now uses ICH_VTR_EL2's implemented list-register count (eight on
 this host), and restore checks the destination inventory before writing CPU state.
 
-The probe in `tests/nested-restore-hvf` rejects watchdog cancellation as successful
-execution. It does not exercise a running inner VM, nested interrupt delivery,
-or full sandbox recovery. Nested snapshot admission remains closed until those
-cases are qualified.
+The small probe in `tests/nested-restore-hvf` rejects watchdog cancellation as
+successful execution. The ARM64 fixture in `tests/nested-restore` additionally
+runs a real KVM child at EL1 with a virtual GIC and 100 Hz timer interrupts.
+Diagnostic full-memory capture and fresh-process restore preserved its identity,
+counter and interrupts for at least ten seconds. Two concurrent restores from
+one baseline passed, as did a separate chain of four successive restores.
+
+That workload exposed a restore-order defect: installing the HVF clock offset
+after timer registers could stall a recaptured VM. Installing the offset first
+resumed the same saved failing snapshot, without discarding clock rebasing.
+However, another recaptured snapshot reproducibly exits KVM with an internal
+error. Subsequent successful runs do not resolve that remaining failure.
+Nested snapshot admission stays closed. This fixture does not qualify a full
+inner operating system, sandbox filesystem recovery or cross-host migration.
