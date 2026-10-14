@@ -1485,7 +1485,11 @@ impl Vmm {
         .map_err(Error::ExecutionState)
     }
 
-    fn require_nested_execution_state_support(&self) -> Result<()> {
+    /// Checks execution-state admission without pausing or changing the VM.
+    ///
+    /// This is a policy preflight, not a guarantee that device or CPU capture
+    /// will succeed. Capture and restore also enforce this policy themselves.
+    pub fn require_nested_execution_state_support(&self) -> Result<()> {
         if self.nested_enabled {
             return Err(Error::NestedExecutionStateUnsupported);
         }
