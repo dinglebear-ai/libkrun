@@ -1578,6 +1578,11 @@ impl Vcpu {
             .set_cpuid2(&self.cpuid)
             .map_err(Error::VcpuSetCpuid)?;
 
+        if self.nested_state_enabled() {
+            self.msr_list = super::nested_state::runtime_msrs()
+                .map_err(|error| Error::StateCodec(format!("nested runtime MSRs: {error}")))?;
+        }
+
         if kernel_boot {
             arch::x86_64::msr::setup_msrs(&self.fd).map_err(Error::MSRSConfiguration)?;
             arch::x86_64::regs::setup_regs(&self.fd, kernel_start_addr.raw_value(), self.id)
@@ -1851,13 +1856,15 @@ impl Vcpu {
                 "destination TSC frequency differs from nested snapshot".into(),
             ));
         }
-        if state
-            .msrs
-            .iter()
-            .any(|entry| !self.msr_list.as_slice().contains(&entry.index))
+        if state.msrs.len() != self.msr_list.as_slice().len()
+            || state
+                .msrs
+                .iter()
+                .zip(self.msr_list.as_slice())
+                .any(|(entry, index)| entry.index != *index)
         {
             return Err(Error::StateCodec(
-                "destination is missing nested snapshot MSRs".into(),
+                "nested snapshot runtime MSR inventory differs from destination".into(),
             ));
         }
         let vmx = self

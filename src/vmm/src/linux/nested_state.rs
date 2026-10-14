@@ -4,7 +4,7 @@
 use std::io;
 use std::os::fd::AsRawFd;
 
-use kvm_bindings::{Msrs, KVM_CAP_NESTED_STATE};
+use kvm_bindings::{MsrList, Msrs, KVM_CAP_NESTED_STATE, KVM_MAX_MSR_ENTRIES};
 use kvm_ioctls::{Kvm, VcpuFd};
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +20,23 @@ const SET_NESTED_STATE: libc::c_ulong = 0x4080_aebf;
 pub(super) struct Snapshot {
     pub(super) state: Vec<u8>,
     pub(super) feature_msrs: Vec<(u32, u64)>,
+}
+
+pub(super) fn runtime_msrs() -> io::Result<MsrList> {
+    // The ordinary guest whitelist omits hypervisor state such as AMD's
+    // VM_HSAVE_PA and TSC ratio. KVM's index list is its save/restore inventory;
+    // nested guests need the complete list, separately from feature MSRs.
+    let indices = Kvm::new()
+        .map_err(io::Error::from)?
+        .get_msr_index_list()
+        .map_err(io::Error::from)?;
+    if indices.as_slice().len() > KVM_MAX_MSR_ENTRIES {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "KVM runtime MSRs exceed the supported nested-state bound",
+        ));
+    }
+    Ok(indices)
 }
 
 fn feature_msrs() -> io::Result<Vec<(u32, u64)>> {

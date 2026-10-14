@@ -40,8 +40,17 @@ It does not qualify sandbox filesystem recovery or CPU migration across hosts.
 
 2026-10-13: Intel Linux/KVM passed capture, fresh-process restore, two independent
 restores from one baseline, and capture/restore of a second generation using the
-candidate KVM capability contract and the diagnostic guard bypass. AMD Linux and
-Intel Windows require their own live-restore results before admission can open.
+candidate KVM capability contract and the diagnostic guard bypass.
+
+2026-10-14: AMD EPYC 9B45 with Linux 7.0.0-1014-gcp passed capture,
+fresh-process restore, concurrent forks and a second snapshot generation after
+two fixes: normalize the guest topology ID instead of retaining the current host
+CPU number, and capture KVM's complete runtime MSR inventory for nested guests.
+The ordinary guest whitelist omitted AMD hypervisor state such as VM_HSAVE_PA.
+Intel Linux capture and restore also passed with the complete inventory.
+Older diagnostic nested artifacts with incomplete MSR inventories now reject
+before restore. The ordinary snapshot format and MSR inventory are unchanged.
+Intel Windows, Linux ARM64 and broader workloads still require qualification.
 
 On Windows the harness uses an explicit `hvc0` output device. On the AMD
 Windows Server 2025 host, the initial diagnostic restore resumed the counter but
