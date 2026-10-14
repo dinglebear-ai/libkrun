@@ -1967,18 +1967,17 @@ impl Vcpu {
             *target = (*source).into();
         }
         let destination_supports_xss = self.msr_list.as_slice().contains(&MSR_IA32_XSS);
-        let (xss, mut generic_msr_states) =
-            split_restored_msrs(&state.msrs, destination_supports_xss)?;
-        // FEATURE_CONTROL can leave VMX operation, so it must not be replayed
-        // after KVM_SET_NESTED_STATE has established the captured nested mode.
-        let feature_control = if nested.is_some() {
-            generic_msr_states
-                .iter()
-                .position(|msr| msr.index == MSR_IA32_FEATURE_CONTROL)
-                .map(|index| generic_msr_states.remove(index))
-        } else {
-            None
-        };
+        let (xss, generic_msr_states) = split_restored_msrs(&state.msrs, destination_supports_xss)?;
+        // FEATURE_CONTROL can leave VMX operation, and KVM rejects writes to
+        // VMX capability MSRs after VMXON. Install both before nested admission.
+        let (nested_setup_msrs, generic_msr_states): (Vec<_>, Vec<_>) =
+            generic_msr_states.into_iter().partition(|msr| {
+                nested.is_some()
+                    && (msr.index == MSR_IA32_FEATURE_CONTROL
+                        || (arch_gen::x86::msr_index::MSR_IA32_VMX_BASIC
+                            ..=arch_gen::x86::msr_index::MSR_IA32_VMX_VMFUNC)
+                            .contains(&msr.index))
+            });
         let mut msrs = Msrs::new(generic_msr_states.len())
             .map_err(|error| Error::StateCodec(error.to_string()))?;
         for (target, source) in msrs.as_mut_slice().iter_mut().zip(&generic_msr_states) {
@@ -1992,12 +1991,14 @@ impl Vcpu {
         self.fd
             .set_mp_state(state.mp_state)
             .map_err(Error::VcpuSetMpState)?;
-        if let Some(feature_control) = feature_control {
-            let control = Msrs::from_entries(&[feature_control.into()])
+        if !nested_setup_msrs.is_empty() {
+            let entries: Vec<kvm_msr_entry> =
+                nested_setup_msrs.iter().copied().map(Into::into).collect();
+            let setup = Msrs::from_entries(&entries)
                 .map_err(|error| Error::StateCodec(error.to_string()))?;
-            if self.fd.set_msrs(&control).map_err(Error::VcpuSetMsrs)? != 1 {
+            if self.fd.set_msrs(&setup).map_err(Error::VcpuSetMsrs)? != entries.len() {
                 return Err(Error::StateCodec(
-                    "KVM did not restore IA32_FEATURE_CONTROL".into(),
+                    "KVM did not restore the nested virtualization setup MSRs".into(),
                 ));
             }
         }
@@ -2038,8 +2039,9 @@ impl Vcpu {
         let restored_msrs = self.fd.set_msrs(&msrs).map_err(Error::VcpuSetMsrs)?;
         if restored_msrs != msrs.as_slice().len() {
             return Err(Error::StateCodec(format!(
-                "KVM restored {restored_msrs} of {} MSRs",
-                msrs.as_slice().len()
+                "KVM restored {restored_msrs} of {} MSRs; rejected index {:#x}",
+                msrs.as_slice().len(),
+                msrs.as_slice()[restored_msrs].index
             )));
         }
         self.fd
