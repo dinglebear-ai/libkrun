@@ -2950,6 +2950,7 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    #[ignore = "requires hardware nesting and KVM_CAP_NESTED_STATE"]
     fn nested_restore_rejects_incomplete_runtime_msr_inventory() {
         let (_vm, mut vcpu, memory) = setup_vcpu(0x1000);
         vcpu.configure_x86_64(
