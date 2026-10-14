@@ -88,6 +88,8 @@ pub(crate) const VCPU_RTSIG_OFFSET: i32 = 0;
 
 #[cfg(target_arch = "x86_64")]
 const MSR_IA32_XSS: u32 = 0x0000_0da0;
+#[cfg(target_arch = "x86_64")]
+const MSR_IA32_FEATURE_CONTROL: u32 = 0x3a;
 
 /// Errors associated with the wrappers over KVM ioctls.
 #[derive(Debug)]
@@ -1965,7 +1967,18 @@ impl Vcpu {
             *target = (*source).into();
         }
         let destination_supports_xss = self.msr_list.as_slice().contains(&MSR_IA32_XSS);
-        let (xss, generic_msr_states) = split_restored_msrs(&state.msrs, destination_supports_xss)?;
+        let (xss, mut generic_msr_states) =
+            split_restored_msrs(&state.msrs, destination_supports_xss)?;
+        // FEATURE_CONTROL can leave VMX operation, so it must not be replayed
+        // after KVM_SET_NESTED_STATE has established the captured nested mode.
+        let feature_control = if nested.is_some() {
+            generic_msr_states
+                .iter()
+                .position(|msr| msr.index == MSR_IA32_FEATURE_CONTROL)
+                .map(|index| generic_msr_states.remove(index))
+        } else {
+            None
+        };
         let mut msrs = Msrs::new(generic_msr_states.len())
             .map_err(|error| Error::StateCodec(error.to_string()))?;
         for (target, source) in msrs.as_mut_slice().iter_mut().zip(&generic_msr_states) {
@@ -1979,10 +1992,27 @@ impl Vcpu {
         self.fd
             .set_mp_state(state.mp_state)
             .map_err(Error::VcpuSetMpState)?;
-        self.fd.set_regs(&state.regs).map_err(Error::VcpuSetRegs)?;
+        if let Some(feature_control) = feature_control {
+            let control = Msrs::from_entries(&[feature_control.into()])
+                .map_err(|error| Error::StateCodec(error.to_string()))?;
+            if self.fd.set_msrs(&control).map_err(Error::VcpuSetMsrs)? != 1 {
+                return Err(Error::StateCodec(
+                    "KVM did not restore IA32_FEATURE_CONTROL".into(),
+                ));
+            }
+        }
         self.fd
             .set_sregs(&state.sregs)
             .map_err(Error::VcpuSetSregs)?;
+        // Match QEMU kvm_arch_put_registers: SREGS supplies EFER.SVME before
+        // nested admission; nested VM entry can overwrite RIP/RSP and debug/MSR
+        // state, so restore the final register values only after that transition.
+        // https://github.com/qemu/qemu/blob/v10.1.0/target/i386/kvm/kvm.c
+        if let Some(nested) = nested {
+            super::nested_state::restore(&self.fd, nested)
+                .map_err(|error| Error::StateCodec(format!("restore nested state: {error}")))?;
+        }
+        self.fd.set_regs(&state.regs).map_err(Error::VcpuSetRegs)?;
         if let Some(xss) = xss {
             let xss = Msrs::from_entries(&[xss.into()])
                 .map_err(|error| Error::StateCodec(error.to_string()))?;
@@ -2011,11 +2041,6 @@ impl Vcpu {
                 "KVM restored {restored_msrs} of {} MSRs",
                 msrs.as_slice().len()
             )));
-        }
-        // Restore nested mode after the CPU/MSRs, before injecting saved events.
-        if let Some(nested) = nested {
-            super::nested_state::restore(&self.fd, nested)
-                .map_err(|error| Error::StateCodec(format!("restore nested state: {error}")))?;
         }
         self.fd
             .set_vcpu_events(&state.vcpu_events)
