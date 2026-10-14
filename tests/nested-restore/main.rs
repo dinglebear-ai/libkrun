@@ -70,6 +70,10 @@ fn main() -> Result<()> {
     };
     fs::write(root.join("console.log"), "")?;
     let mut vm = VmBuilder::new()
+        .on_exit(|code| {
+            eprintln!("FAIL: guest exited with code {code} before the probe completed");
+            std::process::exit(1);
+        })
         .machine(|m| {
             m.vcpus(2)
                 .memory_mib(256)
@@ -81,7 +85,16 @@ fn main() -> Result<()> {
             k.krunfw_path(std::env::var("KRUNFW_PATH").unwrap())
                 .initramfs_path(std::env::var("TEST_INITRAMFS").unwrap())
         })
-        .console(|c| c.output(root.join("console.log")))
+        .console(|c| {
+            #[cfg(target_os = "windows")]
+            {
+                c.disable_implicit().virtio_output(root.join("console.log"))
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                c.output(root.join("console.log"))
+            }
+        })
         .build()?;
     if mode == "restore" {
         vm.set_execution_restore(vmm::execution_state::ExecutionState::decode(&fs::read(
@@ -106,6 +119,7 @@ fn main() -> Result<()> {
             control.wait_until_running(Duration::from_secs(30))?;
             let begin = Instant::now();
             let mut previous = None;
+            let mut progress_started = None;
             loop {
                 if begin.elapsed() > Duration::from_secs(30) {
                     return Err("inner counter/timer did not progress".into());
@@ -123,11 +137,18 @@ fn main() -> Result<()> {
                     if let Some(old) = previous {
                         let (old_count, old_ticks, _): (u32, u32, u64) = old;
                         if current.0 != old_count && current.1 > old_ticks && current.1 > 2 {
-                            println!("{mode}: inner counter={} timer={} (previous={old_count},{old_ticks})",current.0,current.1);
-                            break;
+                            let started = progress_started.get_or_insert_with(Instant::now);
+                            if started.elapsed() >= Duration::from_secs(10) {
+                                println!("{mode}: inner counter={} timer={} (previous={old_count},{old_ticks})",current.0,current.1);
+                                break;
+                            }
+                        } else {
+                            progress_started = None;
                         }
                     }
                     previous = Some(current);
+                } else {
+                    progress_started = None;
                 }
                 thread::sleep(Duration::from_millis(200));
             }
