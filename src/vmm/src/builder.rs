@@ -5118,7 +5118,7 @@ pub mod tests {
         let state = crate::ExecutionState::new(
             crate::current_execution_architecture(),
             crate::current_execution_backend(),
-            crate::current_execution_backend_state_abi(),
+            crate::current_execution_backend_state_abi(true),
             1,
             Vec::new(),
             (0..vmm.vcpus_handles.len())
