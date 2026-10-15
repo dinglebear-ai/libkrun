@@ -3,10 +3,12 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -48,13 +50,18 @@ int main(void) {
 
     // Optional load profile keeps both inner CPUs busy while the outer VM is
     // captured. Disk/timer/identity checks below remain the pass criteria.
-    if (getenv("NESTED_BUSY")) {
+    _Atomic uint64_t *busy = NULL;
+    if (getenv("NESTED_BUSY") && !strcmp(getenv("NESTED_BUSY"), "1")) {
+        busy = mmap(NULL, 2 * sizeof(*busy), PROT_READ | PROT_WRITE,
+                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (busy == MAP_FAILED) fail("map busy counters");
+        atomic_init(&busy[0], 0);
+        atomic_init(&busy[1], 0);
         for (unsigned i = 0; i < 2; ++i) {
             pid_t child = fork();
             if (child < 0) fail("fork busy worker");
             if (child == 0) {
-                volatile uint64_t counter = 0;
-                for (;;) ++counter;
+                for (;;) atomic_fetch_add_explicit(&busy[i], 1, memory_order_relaxed);
             }
         }
         puts("NESTED_BUSY workers=2");
@@ -84,6 +91,11 @@ int main(void) {
         struct timespec now;
         if (clock_gettime(CLOCK_MONOTONIC, &now)) fail("clock_gettime");
         uint32_t elapsed_ms = (uint32_t)((uint64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000);
+        if (busy) {
+            printf("NESTED_BUSY_PROGRESS %" PRIu64 " %" PRIu64 "\n",
+                   atomic_load_explicit(&busy[0], memory_order_relaxed),
+                   atomic_load_explicit(&busy[1], memory_order_relaxed));
+        }
         printf("NESTED_PROGRESS %" PRIu32 " %" PRIu32 " %" PRIu64 " disk=%" PRIu64 "\n",
                (uint32_t)generation, elapsed_ms, identity, actual.generation);
         struct timespec delay = {.tv_nsec = 100000000};

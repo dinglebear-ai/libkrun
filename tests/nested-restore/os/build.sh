@@ -17,6 +17,7 @@ sudo mknod "$parent/dev/console" c 5 1
 cp "$kernel" "$parent/inner-kernel"
 cp "$source_dir/parent-init.sh" "$parent/init"
 chmod +x "$parent/init"
+if [ "${NESTED_BUSY:-0}" = 1 ]; then touch "$parent/nested-busy"; fi
 cp /bin/busybox "$parent/bin/busybox"
 case "$(uname -m)" in
     x86_64) qemu=$(command -v qemu-system-x86_64) ;;
