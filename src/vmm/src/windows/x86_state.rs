@@ -39,6 +39,7 @@ struct CpuState {
 pub(super) fn capture_vm(
     partition: WHV_PARTITION_HANDLE,
     router: &ApStartupRouter,
+    nested_enabled: bool,
 ) -> Result<Vec<u8>> {
     let startup = router
         .slots
@@ -49,20 +50,31 @@ pub(super) fn capture_vm(
                 .map_err(|_| codec("startup state mutex poisoned"))
         })
         .collect::<Result<Vec<_>>>()?;
-    encode(&VmState {
-        features: features(partition)?,
+    let state = VmState {
+        features: features(partition, nested_enabled)?,
         tsc_frequency: frequency()?,
         startup,
-    })
+    };
+    if nested_enabled {
+        encode(&(state, reference_time(partition)?))
+    } else {
+        encode(&state)
+    }
 }
 
 pub(super) fn restore_vm(
     partition: WHV_PARTITION_HANDLE,
     router: &ApStartupRouter,
     bytes: &[u8],
+    nested_enabled: bool,
 ) -> Result<()> {
-    let state: VmState = decode(bytes)?;
-    if state.features != features(partition)?
+    let (state, reference_time): (VmState, Option<u64>) = if nested_enabled {
+        let (state, time) = decode(bytes)?;
+        (state, Some(time))
+    } else {
+        (decode(bytes)?, None)
+    };
+    if state.features != features(partition, nested_enabled)?
         || state.tsc_frequency != frequency()?
         || state.startup.len() != router.slots.len()
         || state.startup.first() != Some(&ApParkState::Running)
@@ -74,6 +86,23 @@ pub(super) fn restore_vm(
     // A newly constructed partition has never run. Explicitly freeze before
     // installing TSC/APIC state so construction latency cannot age the snapshot.
     super::set_partition_time_running(partition, false)?;
+    if let Some(reference_time) = reference_time {
+        // Hyper-V's reference clock must resume at the captured epoch before
+        // reference-TSC and per-CPU state are installed.
+        let status = unsafe {
+            WHvSetPartitionProperty(
+                partition,
+                WHvPartitionPropertyCodeReferenceTime,
+                (&reference_time as *const u64).cast(),
+                8,
+            )
+        };
+        if status < 0 {
+            return Err(codec(format!(
+                "WHP reference time restore: HRESULT {status:#x}"
+            )));
+        }
+    }
     for (slot, value) in router.slots.iter().zip(state.startup) {
         *slot
             .lock()
@@ -111,9 +140,7 @@ pub(super) fn capture_cpu(
 
 fn encode_cpu_payload(state: &CpuState, nested: Option<&[u8]>) -> Result<Vec<u8>> {
     if let Some(nested) = nested {
-        if nested.is_empty() {
-            return Err(codec("WHP returned no nested execution state"));
-        }
+        validate_nested_state(nested)?;
         encode(&(state, nested))
     } else {
         encode(state)
@@ -123,12 +150,30 @@ fn encode_cpu_payload(state: &CpuState, nested: Option<&[u8]>) -> Result<Vec<u8>
 fn decode_cpu_payload(bytes: &[u8], nested_enabled: bool) -> Result<(CpuState, Option<Vec<u8>>)> {
     if nested_enabled {
         let (state, nested): (CpuState, Vec<u8>) = decode(bytes)?;
-        if nested.is_empty() {
-            return Err(codec("missing WHP nested execution state"));
-        }
+        validate_nested_state(&nested)?;
         Ok((state, Some(nested)))
     } else {
         Ok((decode(bytes)?, None))
+    }
+}
+
+// WHV_NESTED_STATE is an 8192-byte SDK structure. Its VMX header uses
+// CurrentVmcsValid (bit 2) and VmcsEnlightened (bit 4). Ordinary current VMCS
+// backing RAM may be stale even when WHP returns the current cached fields;
+// restoring that state can later reload stale RAM. Never patch its private
+// layout. Require the documented guest-maintained eVMCS representation instead.
+fn validate_nested_state(bytes: &[u8]) -> Result<()> {
+    if bytes.len() != 8192 {
+        return Err(codec("invalid WHP nested execution state size"));
+    }
+    let vendor = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+    let flags = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    match vendor {
+        0 if flags & (1 << 2) != 0 && flags & (1 << 4) == 0 => Err(codec(
+            "Intel nested snapshots require Hyper-V enlightened VMCS in the guest kernel",
+        )),
+        0 | 1 => Ok(()),
+        _ => Err(codec("unknown WHP nested execution state vendor")),
     }
 }
 
@@ -250,6 +295,7 @@ fn register_names(partition: WHV_PARTITION_HANDLE, id: u8) -> Result<Vec<WHV_REG
         WHvX64RegisterXfdErr,
         WHvX64RegisterPendingDebugException,
         WHvX64RegisterMsrMtrrDefType,
+        // Hyper-V requires the guest OS ID before enabling the hypercall page.
         WHvRegisterGuestOsId,
         WHvX64RegisterHypercall,
         WHvRegisterVpAssistPage,
@@ -274,39 +320,63 @@ fn register_names(partition: WHV_PARTITION_HANDLE, id: u8) -> Result<Vec<WHV_REG
     Ok(names)
 }
 
-fn features(partition: WHV_PARTITION_HANDLE) -> Result<Vec<Vec<u8>>> {
-    [
+fn features(partition: WHV_PARTITION_HANDLE, nested_enabled: bool) -> Result<Vec<Vec<u8>>> {
+    let mut codes = vec![
         WHvPartitionPropertyCodeProcessorFeaturesBanks,
         WHvPartitionPropertyCodeProcessorXsaveFeatures,
         WHvPartitionPropertyCodeLocalApicEmulationMode,
         WHvPartitionPropertyCodeInterruptClockFrequency,
-    ]
-    .into_iter()
-    .map(|code| {
-        let mut buffer = [0_u64; 32];
-        let mut written = 0;
-        let status = unsafe {
-            WHvGetPartitionProperty(
-                partition,
-                code,
-                buffer.as_mut_ptr().cast(),
-                std::mem::size_of_val(&buffer) as u32,
-                &mut written,
-            )
-        };
-        if status < 0 || written == 0 || written as usize > std::mem::size_of_val(&buffer) {
-            return Err(codec(format!(
-                "partition feature {code:#x}: HRESULT {status:#x}"
-            )));
-        }
-        let bytes = buffer
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .take(written as usize)
-            .collect();
-        Ok(bytes)
-    })
-    .collect()
+    ];
+    if nested_enabled {
+        codes.push(WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks);
+    }
+    codes
+        .into_iter()
+        .map(|code| {
+            let mut buffer = [0_u64; 32];
+            let mut written = 0;
+            let status = unsafe {
+                WHvGetPartitionProperty(
+                    partition,
+                    code,
+                    buffer.as_mut_ptr().cast(),
+                    std::mem::size_of_val(&buffer) as u32,
+                    &mut written,
+                )
+            };
+            if status < 0 || written == 0 || written as usize > std::mem::size_of_val(&buffer) {
+                return Err(codec(format!(
+                    "partition feature {code:#x}: HRESULT {status:#x}"
+                )));
+            }
+            let bytes = buffer
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .take(written as usize)
+                .collect();
+            Ok(bytes)
+        })
+        .collect()
+}
+
+fn reference_time(partition: WHV_PARTITION_HANDLE) -> Result<u64> {
+    let mut value = 0u64;
+    let mut written = 0;
+    let status = unsafe {
+        WHvGetPartitionProperty(
+            partition,
+            WHvPartitionPropertyCodeReferenceTime,
+            (&mut value as *mut u64).cast(),
+            8,
+            &mut written,
+        )
+    };
+    if status < 0 || written != 8 {
+        return Err(codec(format!(
+            "WHP reference time capture: HRESULT {status:#x}"
+        )));
+    }
+    Ok(value)
 }
 
 fn frequency() -> Result<u64> {
@@ -338,6 +408,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nested_snapshot_rejects_an_ordinary_current_vmx_cache() {
+        let mut state = vec![0; 8192];
+        state[4..8].copy_from_slice(&6u32.to_le_bytes());
+        assert!(validate_nested_state(&state)
+            .unwrap_err()
+            .to_string()
+            .contains("enlightened VMCS"));
+        state[4..8].copy_from_slice(&54u32.to_le_bytes());
+        assert!(validate_nested_state(&state).is_ok());
+        state[..4].copy_from_slice(&1u32.to_le_bytes());
+        state[4..8].copy_from_slice(&6u32.to_le_bytes());
+        assert!(validate_nested_state(&state).is_ok());
+        state[..4].copy_from_slice(&2u32.to_le_bytes());
+        assert!(validate_nested_state(&state).is_err());
+        assert!(validate_nested_state(&state[..8191]).is_err());
+    }
+
+    #[test]
     fn nested_execution_payload_preserves_state_and_rejects_corruption() {
         let state = CpuState {
             registers: vec![(WHvX64RegisterRip, [0x42; 16])],
@@ -351,7 +439,9 @@ mod tests {
         assert_eq!(ordinary.registers, state.registers);
         assert!(nested.is_none());
 
-        let nested = vec![0x5a; 8192];
+        let mut nested = vec![0x5a; 8192];
+        nested[..4].copy_from_slice(&0u32.to_le_bytes());
+        nested[4..8].copy_from_slice(&54u32.to_le_bytes());
         let payload = encode_cpu_payload(&state, Some(&nested)).unwrap();
         let (restored, restored_nested) = decode_cpu_payload(&payload, true).unwrap();
         assert_eq!(restored_nested.unwrap(), nested);

@@ -452,8 +452,9 @@ fn current_execution_backend_state_abi(nested_enabled: bool) -> u32 {
         // ABI 3 binds the nested-state blob to the source KVM feature MSRs.
         3
     } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) && nested_enabled {
-        // WHP nested payloads append the backend state blob to ordinary CPU state.
-        2
+        // ABI 3 adds the synthetic feature contract and partition reference time.
+        // Reject older Intel snapshots that can contain an ordinary VMCS cache.
+        3
     } else {
         1
     }
