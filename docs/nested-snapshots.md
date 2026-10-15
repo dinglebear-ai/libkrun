@@ -99,7 +99,10 @@ review each vendor's active nested restore ordering before opening admission.
 ## Windows x86 implementation status
 
 The draft backend requests WHP's bounded opaque NestedState blob alongside its existing
-CPU state, retains ordinary ABI 1 payloads, and uses ABI 2 for nested payloads. Restore
+CPU state. Ordinary snapshots now use backend ABI 2; enlightened nested snapshots
+use ABI 4. Both include the complete supported emulated PIT state: channel registers,
+reload/mode, remaining time, partial writes, and channel-2 read position. The PIT
+worker stops before interrupt-state capture and resumes only after restoration. Restore
 installs nested state before APIC/SynIC state. Missing nested state is an error.
 
 The VMM gate remains closed. Intel nested restore ordering and destination VMX/SVM
@@ -120,3 +123,12 @@ preserving workload identity and both counter and PIT interrupt progress.
 The ordinary build still rejects nested capture. These results do not qualify
 Intel Windows, other nested interrupt workloads, cross-host migration or sandbox
 filesystem recovery; the public guard remains closed.
+
+Older ordinary ABI 1 and enlightened nested ABI 3 snapshots omitted the PIT. Normal
+restore rejects them with recovery guidance rather than risking a frozen guest clock.
+`ExecutionState::recover_windows_periodic_pit(divisor)` explicitly supplies a known
+periodic channel-0 reload (1..=65536), starting a fresh period. It preserves the
+original CPU payload and does not bypass host compatibility checks. The missing
+phase, partial programming, and other channels cannot be reconstructed; validate
+the recovered guest and capture a new snapshot. Older nested ABI 2 snapshots cannot
+use this recovery because their non-enlightened VMCS state is independently unsafe.
