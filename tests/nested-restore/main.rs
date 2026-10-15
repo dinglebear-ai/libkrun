@@ -46,18 +46,51 @@ impl VmMemoryRestoreSource for Memory {
         }
     }
 }
-fn progress(path: &std::path::Path) -> Option<(u32, u32, u64)> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Progress {
+    count: u32,
+    ticks: u32,
+    identity: u64,
+    workers: Option<[u64; 2]>,
+}
+impl Progress {
+    fn advanced_from(self, old: Self) -> bool {
+        self.count != old.count
+            && self.ticks > old.ticks
+            && self.ticks > 2
+            && match (old.workers, self.workers) {
+                (None, None) => true,
+                (Some(a), Some(b)) => b[0] > a[0] && b[1] > a[1],
+                _ => false,
+            }
+    }
+}
+fn progress(path: &std::path::Path) -> Option<Progress> {
     let text = fs::read_to_string(path).ok()?;
-    // Console writes can split a decimal identity at any digit. Ignore the
-    // unfinished record so a partial number cannot look like a cold reboot.
+    // Ignore unfinished console records, including a split workload identity.
     let (text, _) = text.rsplit_once('\n')?;
-    text.lines().rev().find_map(|line| {
+    let busy = text.lines().any(|line| line == "NESTED_BUSY workers=2")
+        || text
+            .lines()
+            .any(|line| line.starts_with("NESTED_BUSY_PROGRESS "));
+    let lines: Vec<_> = text.lines().collect();
+    lines.iter().enumerate().rev().find_map(|(index, line)| {
         let mut fields = line.strip_prefix("NESTED_PROGRESS ")?.split_whitespace();
-        Some((
-            fields.next()?.parse().ok()?,
-            fields.next()?.parse().ok()?,
-            fields.next()?.parse().ok()?,
-        ))
+        let workers = if busy {
+            let mut values = lines
+                .get(index.checked_sub(1)?)?
+                .strip_prefix("NESTED_BUSY_PROGRESS ")?
+                .split_whitespace();
+            Some([values.next()?.parse().ok()?, values.next()?.parse().ok()?])
+        } else {
+            None
+        };
+        Some(Progress {
+            count: fields.next()?.parse().ok()?,
+            ticks: fields.next()?.parse().ok()?,
+            identity: fields.next()?.parse().ok()?,
+            workers,
+        })
     })
 }
 fn main() -> Result<()> {
@@ -151,20 +184,20 @@ fn main() -> Result<()> {
                 }
                 if let Some(current) = progress(&root.join("console.log")) {
                     if let Some(saved) = saved {
-                        if current.2 != saved.2 {
+                        if current.identity != saved.identity {
                             return Err("inner workload cold-booted instead of restoring".into());
                         }
-                        if current.1 <= saved.1 {
+                        if current.ticks <= saved.ticks {
                             thread::sleep(Duration::from_millis(200));
                             continue;
                         }
                     }
                     if let Some(old) = previous {
-                        let (old_count, old_ticks, _): (u32, u32, u64) = old;
-                        if current.0 != old_count && current.1 > old_ticks && current.1 > 2 {
+                        let old: Progress = old;
+                        if current.advanced_from(old) {
                             let started = progress_started.get_or_insert_with(Instant::now);
                             if started.elapsed() >= Duration::from_secs(10) {
-                                println!("{mode}: inner counter={} timer={} (previous={old_count},{old_ticks})",current.0,current.1);
+                                println!("{mode}: inner progress={current:?} (previous={old:?})");
                                 break;
                             }
                         } else {
@@ -240,9 +273,39 @@ mod tests {
             .write_all(b"456\n")
             .unwrap();
         let complete = progress(&path);
+        fs::write(
+            &path,
+            "NESTED_BUSY workers=2\nNESTED_BUSY_PROGRESS 10 20\nNESTED_PROGRESS 1 10 123456\n",
+        )
+        .unwrap();
+        let busy = progress(&path).unwrap();
+        for (workers, advances) in [("11 20", false), ("10 21", false), ("11 21", true)] {
+            fs::write(
+                &path,
+                format!("NESTED_BUSY_PROGRESS {workers}\nNESTED_PROGRESS 2 20 123456\n"),
+            )
+            .unwrap();
+            assert_eq!(progress(&path).unwrap().advanced_from(busy), advances);
+        }
         fs::remove_file(path).unwrap();
 
-        assert_eq!(partial, Some((1, 10, 123456)));
-        assert_eq!(complete, Some((2, 20, 123456)));
+        assert_eq!(
+            partial,
+            Some(Progress {
+                count: 1,
+                ticks: 10,
+                identity: 123456,
+                workers: None
+            })
+        );
+        assert_eq!(
+            complete,
+            Some(Progress {
+                count: 2,
+                ticks: 20,
+                identity: 123456,
+                workers: None
+            })
+        );
     }
 }

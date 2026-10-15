@@ -26,8 +26,8 @@ For sustained execution on both inner CPUs, run the build command with
 `NESTED_BUSY=1` in its environment. For a custom QEMU runner, append
 `NESTED_BUSY=1` to the inner kernel command line. The fixture reports
 `NESTED_BUSY workers=2` and a `NESTED_BUSY_PROGRESS` record with both worker
-counters. Require both counters to advance after restore, alongside the existing
-disk, identity and timer checks. Use this profile in addition to the default
+counters. The shared harness requires both counters to advance throughout its
+ten-second observation window, alongside the existing disk, identity and timer checks. Use this profile in addition to the default
 sleeping workload.
 
 Use the [shared harness](../README.md), with these additional settings:
