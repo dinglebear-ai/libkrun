@@ -46,6 +46,20 @@ int main(void) {
     if (dir < 0 || fsync(dir)) fail("sync directory");
     close(dir);
 
+    // Optional load profile keeps both inner CPUs busy while the outer VM is
+    // captured. Disk/timer/identity checks below remain the pass criteria.
+    if (getenv("NESTED_BUSY")) {
+        for (unsigned i = 0; i < 2; ++i) {
+            pid_t child = fork();
+            if (child < 0) fail("fork busy worker");
+            if (child == 0) {
+                volatile uint64_t counter = 0;
+                for (;;) ++counter;
+            }
+        }
+        puts("NESTED_BUSY workers=2");
+    }
+
     for (;;) {
         // Verify restored disk contents before overwriting them with the next record.
         int error = posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);

@@ -18,6 +18,14 @@ The inner kernel must have initramfs, devtmpfs, ext4, virtio block and console
 support built in. x86 uses Q35, PCI virtio block and `ttyS0`; ARM64 uses the `virt`
 machine, MMIO virtio block and `ttyAMA0`. Supply a bzImage on x86 or an Image on
 ARM64. The outer kernel needs KVM and the matching hardware virtualization backend.
+On Intel Windows it also needs `CONFIG_HYPERV=y`; confirm the kernel reports
+`Using Hyper-V Enlightened VMCS`. A test firmware without Hyper-V support does
+not exercise the supported Intel nested-snapshot path.
+
+For sustained execution on both inner CPUs, append `NESTED_BUSY=1` to the inner
+kernel command line. The fixture starts two busy workers and reports
+`NESTED_BUSY workers=2`; the same disk, identity and timer checks remain mandatory.
+Use this profile in addition to the default sleeping workload.
 
 Use the [shared harness](../README.md), with these additional settings:
 
