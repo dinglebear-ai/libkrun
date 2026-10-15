@@ -1363,7 +1363,11 @@ impl Vmm {
         #[cfg(target_os = "windows")]
         self.vm.resume_execution_time().map_err(Error::Vm)?;
         #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-        self.pit.lock().unwrap().resume();
+        self.pit
+            .lock()
+            .unwrap()
+            .resume()
+            .map_err(Error::ExecutionStateBackend)?;
         #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
         self.vm
             .resume_execution_time(&self.vcpus_handles)

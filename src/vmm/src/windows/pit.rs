@@ -1,12 +1,20 @@
 //! Checkpointable Windows legacy PIT. The worker is fenced before IRQ state is captured.
 
-use std::sync::{Arc, Condvar, Mutex};
+use std::io;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
 use devices::legacy::IrqChip;
+use utils::event::{EventNotifier, RawEventSource};
+use windows_sys::Win32::Foundation::WAIT_FAILED;
+use windows_sys::Win32::System::Threading::{
+    CreateWaitableTimerExW, SetWaitableTimerEx, WaitForMultipleObjects,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
+};
 
 const TICK_HZ: u64 = 1_193_182;
 const MAX_PERIOD_NS: u64 = 65_536 * 1_000_000_000 / TICK_HZ;
@@ -31,10 +39,11 @@ struct Clock {
     state: PitState,
     resumed_at: Option<Instant>,
     stopped: bool,
+    failure: Option<String>,
 }
 
 pub(crate) struct Pit {
-    shared: Arc<(Mutex<Clock>, Condvar)>,
+    shared: Arc<(Mutex<Clock>, EventNotifier)>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -95,70 +104,130 @@ impl Clock {
 }
 
 impl Pit {
-    pub(crate) fn new(intc: IrqChip) -> Self {
+    pub(crate) fn new(intc: IrqChip) -> io::Result<Self> {
+        // Condvar timeouts use the Windows scheduler tick (often 15.6 ms), which
+        // is too coarse for guest PIT calibration and a 250 Hz guest clock.
+        let handle = unsafe {
+            CreateWaitableTimerExW(
+                std::ptr::null(),
+                std::ptr::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS,
+            )
+        };
+        if handle.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the unnamed timer is a new, non-inherited handle owned by this worker.
+        let timer = unsafe { OwnedHandle::from_raw_handle(handle) };
         let shared = Arc::new((
             Mutex::new(Clock {
                 state: PitState::default(),
                 resumed_at: None,
                 stopped: false,
+                failure: None,
             }),
-            Condvar::new(),
+            EventNotifier::new()?,
         ));
         let thread_shared = shared.clone();
-        let worker = std::thread::spawn(move || {
-            let (lock, wake) = &*thread_shared;
-            let mut clock = lock.lock().unwrap();
-            loop {
-                if clock.stopped {
-                    break;
+        let worker = std::thread::Builder::new()
+            .name("pit".into())
+            .spawn(move || {
+                let (lock, wake) = &*thread_shared;
+                let mut clock = lock.lock().unwrap();
+                loop {
+                    if clock.stopped {
+                        break;
+                    }
+                    clock.advance(Instant::now());
+                    let remaining = clock.resumed_at.and(clock.state.remaining_ns);
+                    if remaining == Some(0) {
+                        // Fence in-flight injection before pause returns.
+                        if let Err(error) = intc.lock().unwrap().set_irq(Some(0), None) {
+                            log::trace!("PIT tick interrupt injection failed: {error:?}");
+                        }
+                        clock.advance(Instant::now());
+                        clock.state.remaining_ns = clock
+                            .state
+                            .periodic
+                            .then(|| clock.state.period_ns.max(1_000_000));
+                        continue;
+                    }
+                    // Reset the wake event while holding the state lock, so a concurrent
+                    // pause, reload or resume cannot lose its notification before the wait.
+                    let armed = wake.drain().and_then(|()| {
+                        if let Some(ns) = remaining {
+                            let due = -(ns.div_ceil(100).max(1) as i64);
+                            if unsafe {
+                                SetWaitableTimerEx(
+                                    timer.as_raw_handle(),
+                                    &due,
+                                    0,
+                                    None,
+                                    std::ptr::null(),
+                                    std::ptr::null(),
+                                    0,
+                                )
+                            } == 0
+                            {
+                                return Err(io::Error::last_os_error());
+                            }
+                        }
+                        Ok(())
+                    });
+                    drop(clock);
+                    let waited = armed.and_then(|()| {
+                        let RawEventSource::WaitableHandle(event) = wake.event_source(0).raw()
+                        else {
+                            unreachable!("Windows notifier must be waitable")
+                        };
+                        let handles = [event, timer.as_raw_handle()];
+                        let count = if remaining.is_some() { 2 } else { 1 };
+                        if unsafe { WaitForMultipleObjects(count, handles.as_ptr(), 0, u32::MAX) }
+                            == WAIT_FAILED
+                        {
+                            return Err(io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                    clock = lock.lock().unwrap();
+                    if let Err(error) = waited {
+                        log::error!("Windows PIT wait failed: {error}");
+                        clock.failure = Some(error.to_string());
+                        break;
+                    }
                 }
-                clock.advance(Instant::now());
-                if clock.resumed_at.is_none() || clock.state.remaining_ns.is_none() {
-                    clock = wake.wait(clock).unwrap();
-                    continue;
-                }
-                let remaining = clock.state.remaining_ns.unwrap();
-                if remaining != 0 {
-                    clock = wake
-                        .wait_timeout(clock, Duration::from_nanos(remaining))
-                        .unwrap()
-                        .0;
-                    continue;
-                }
-                // Hold the clock lock through injection: pause cannot return with an IRQ in flight.
-                if let Err(error) = intc.lock().unwrap().set_irq(Some(0), None) {
-                    log::trace!("PIT tick interrupt injection failed: {error:?}");
-                }
-                clock.state.remaining_ns = clock
-                    .state
-                    .periodic
-                    .then(|| clock.state.period_ns.max(1_000_000));
-                clock.resumed_at = Some(Instant::now());
-            }
-        });
-        Self {
+            })?;
+        Ok(Self {
             shared,
             worker: Some(worker),
-        }
+        })
     }
 
     pub(crate) fn pause(&self) {
         let mut clock = self.shared.0.lock().unwrap();
         clock.advance(Instant::now());
         clock.resumed_at = None;
-        self.shared.1.notify_all();
+        self.shared.1.wake().expect("valid PIT wake event");
     }
 
-    pub(crate) fn resume(&self) {
+    pub(crate) fn resume(&self) -> Result<(), String> {
         let mut clock = self.shared.0.lock().unwrap();
+        if let Some(error) = &clock.failure {
+            return Err(format!("Windows PIT worker failed: {error}"));
+        }
         if clock.resumed_at.is_none() {
             clock.resumed_at = Some(Instant::now());
         }
-        self.shared.1.notify_all();
+        self.shared.1.wake().map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub(crate) fn capture(&self) -> Result<PitState, String> {
         let clock = self.shared.0.lock().unwrap();
+        if let Some(error) = &clock.failure {
+            return Err(format!("Windows PIT worker failed: {error}"));
+        }
         if clock.resumed_at.is_some() {
             return Err("PIT capture requires paused execution".into());
         }
@@ -168,6 +237,9 @@ impl Pit {
     pub(crate) fn restore(&self, state: PitState) -> Result<(), String> {
         state.validate()?;
         let mut clock = self.shared.0.lock().unwrap();
+        if let Some(error) = &clock.failure {
+            return Err(format!("Windows PIT worker failed: {error}"));
+        }
         if clock.resumed_at.is_some() {
             return Err("PIT restore requires paused execution".into());
         }
@@ -179,7 +251,7 @@ impl Pit {
 impl Drop for Pit {
     fn drop(&mut self) {
         self.shared.0.lock().unwrap().stopped = true;
-        self.shared.1.notify_all();
+        self.shared.1.wake().expect("valid PIT wake event");
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -277,7 +349,7 @@ impl devices::BusDevice for Pit {
             }
             _ => {}
         }
-        self.shared.1.notify_all();
+        self.shared.1.wake().expect("valid PIT wake event");
     }
 }
 
@@ -287,6 +359,7 @@ mod tests {
     use devices::legacy::{IrqChipDevice, IrqChipT};
     use devices::BusDevice;
     use std::sync::mpsc::{self, Receiver, Sender};
+    use std::time::Duration;
     use utils::eventfd::EventFd;
 
     struct Interrupts(Sender<u32>);
@@ -314,7 +387,8 @@ mod tests {
         (
             Pit::new(Arc::new(Mutex::new(IrqChipDevice::new(Box::new(
                 Interrupts(send),
-            ))))),
+            )))))
+            .unwrap(),
             recv,
         )
     }
@@ -330,12 +404,29 @@ mod tests {
     }
 
     #[test]
+    fn periodic_timer_keeps_millisecond_cadence() {
+        let (mut pit, irqs) = timer();
+        pit.write(0, 3, &[0x34]);
+        pit.write(0, 0, &[0xa5]);
+        pit.write(0, 0, &[0x12]); // 4773 ticks, approximately 4 ms.
+        let start = Instant::now();
+        pit.resume().unwrap();
+        for _ in 0..200 {
+            let remaining = Duration::from_secs(2)
+                .checked_sub(start.elapsed())
+                .expect("250 Hz PIT fell below 100 Hz");
+            assert_eq!(irqs.recv_timeout(remaining).unwrap(), 0);
+        }
+        pit.pause();
+    }
+
+    #[test]
     fn periodic_timer_stops_at_pause_and_survives_serialized_restore() {
         let (mut source, source_irqs) = timer();
         source.write(0, 3, &[0x34]);
         source.write(0, 0, &[0xa9]);
         source.write(0, 0, &[0x04]); // ~1 ms period.
-        source.resume();
+        source.resume().unwrap();
         assert_eq!(source_irqs.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
         source.pause();
         while source_irqs.try_recv().is_ok() {}
@@ -346,7 +437,7 @@ mod tests {
         let (restored, irqs) = timer();
         roundtrip(&source, &restored);
         assert!(irqs.recv_timeout(Duration::from_millis(100)).is_err());
-        restored.resume();
+        restored.resume().unwrap();
         for _ in 0..3 {
             assert_eq!(irqs.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
         }
@@ -363,13 +454,13 @@ mod tests {
         let (mut restored, irqs) = timer();
         roundtrip(&source, &restored);
         restored.write(0, 0, &[0xff]);
-        restored.resume();
+        restored.resume().unwrap();
         assert_eq!(irqs.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
         assert!(irqs.recv_timeout(Duration::from_millis(150)).is_err());
         restored.pause();
         let (again, again_irqs) = timer();
         roundtrip(&restored, &again);
-        again.resume();
+        again.resume().unwrap();
         assert!(again_irqs.recv_timeout(Duration::from_millis(150)).is_err());
     }
 

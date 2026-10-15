@@ -1686,7 +1686,13 @@ pub fn build_microvm_paused(
         )))));
         #[cfg(target_arch = "x86_64")]
         {
-            pit = Arc::new(Mutex::new(crate::windows::pit::Pit::new(intc.clone())));
+            pit = Arc::new(Mutex::new(
+                crate::windows::pit::Pit::new(intc.clone()).map_err(|error| {
+                    StartMicrovmError::Internal(Error::ExecutionStateBackend(format!(
+                        "create Windows PIT: {error}"
+                    )))
+                })?,
+            ));
         }
         #[cfg(target_arch = "x86_64")]
         let pio_bus = create_windows_x86_64_pio_bus(
