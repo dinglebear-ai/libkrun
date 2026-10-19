@@ -5,7 +5,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -65,6 +65,27 @@ pub struct MemoryMetrics {
     pub host_resident_bytes: Option<u64>,
 }
 
+/// One coherent guest report; configured allocation remains `MemoryMetrics::total_bytes`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuestMemoryObservation {
+    /// Guest usable total, including only capacity the guest reports usable.
+    pub total_bytes: u64,
+    /// Guest available memory from the same report.
+    pub available_bytes: u64,
+    /// Host-wide monotonic receipt time, not the host sampler's read time.
+    pub received_at: Duration,
+    /// Guest reporting interval, independent of host sampling cadence.
+    pub reporting_interval: Duration,
+    /// Observation epoch; invalidation rejects responses to earlier requests.
+    pub epoch: u64,
+}
+
+#[derive(Default)]
+struct GuestMemoryState {
+    epoch: u64,
+    observation: Option<GuestMemoryObservation>,
+}
+
 /// Aggregate block metrics.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BlockMetrics {
@@ -102,6 +123,7 @@ struct MetricsState {
     vcpu_time_ns: AtomicU64,
     vcpu_time_valid: AtomicU64,
     memory_total_bytes: AtomicU64,
+    guest_memory: Mutex<GuestMemoryState>,
     memory_available_bytes: AtomicU64,
     memory_available_valid: AtomicU64,
     memory_host_resident_bytes: AtomicU64,
@@ -129,6 +151,20 @@ struct BlockDeviceState {
 //--------------------------------------------------------------------------------------------------
 
 impl MetricsHandle {
+    /// Return the last coherent report without refreshing its receipt time.
+    /// Callers apply freshness using the guest cadence and the host monotonic clock.
+    pub fn guest_memory_observation(&self) -> Option<GuestMemoryObservation> {
+        self.state.guest_memory.lock().unwrap().observation
+    }
+
+    /// Invalidate reports across pause/restore/replacement. Responses to requests
+    /// from the prior epoch cannot make the old observation fresh again.
+    pub fn invalidate_guest_memory_observation(&self) {
+        let mut state = self.state.guest_memory.lock().unwrap();
+        state.epoch = state.epoch.wrapping_add(1);
+        state.observation = None;
+    }
+
     /// Return a coherent-enough snapshot of current VM metrics.
     ///
     /// Counters are monotonic atomics. Callers that need rates should compute
@@ -250,6 +286,47 @@ impl MetricsHandle {
 }
 
 impl MetricsWriter {
+    /// Epoch to bind to a guest statistics request before returning its buffer.
+    pub fn guest_memory_epoch(&self) -> u64 {
+        self.state.guest_memory.lock().unwrap().epoch
+    }
+
+    /// Publish a complete guest report with receipt time captured exactly once.
+    /// A malformed report invalidates the pair; an earlier epoch cannot overwrite
+    /// a later report. Legacy configured/available accounting remains independent.
+    pub fn record_guest_memory_observation(
+        &self,
+        epoch: u64,
+        total_bytes: u64,
+        available_bytes: u64,
+        reporting_interval: Duration,
+    ) -> bool {
+        let mut state = self.state.guest_memory.lock().unwrap();
+        if state.epoch != epoch {
+            return false;
+        }
+        state.observation = host_monotonic_time()
+            .filter(|_| {
+                total_bytes != 0 && available_bytes <= total_bytes && !reporting_interval.is_zero()
+            })
+            .map(|received_at| GuestMemoryObservation {
+                total_bytes,
+                available_bytes,
+                received_at,
+                reporting_interval,
+                epoch,
+            });
+        state.observation.is_some()
+    }
+
+    /// Discard an incomplete or malformed response without changing request identity.
+    pub fn discard_guest_memory_observation(&self, epoch: u64) {
+        let mut state = self.state.guest_memory.lock().unwrap();
+        if state.epoch == epoch {
+            state.observation = None;
+        }
+    }
+
     /// Return a public read handle for this metrics state.
     pub fn handle(&self) -> MetricsHandle {
         MetricsHandle {
@@ -374,6 +451,7 @@ impl Default for MetricsState {
             vcpu_time_ns: AtomicU64::new(0),
             vcpu_time_valid: AtomicU64::new(0),
             memory_total_bytes: AtomicU64::new(0),
+            guest_memory: Mutex::new(GuestMemoryState::default()),
             memory_available_bytes: AtomicU64::new(0),
             memory_available_valid: AtomicU64::new(0),
             memory_host_resident_bytes: AtomicU64::new(0),
@@ -409,6 +487,35 @@ fn valid_value(valid: &AtomicU64, value: &AtomicU64) -> Option<u64> {
     }
 }
 
+// Use the same boot-relative clocks as the metrics registry; never substitute a
+// wall clock, process-relative Instant, or sampler timestamp for a receipt.
+fn host_monotonic_time() -> Option<Duration> {
+    #[cfg(unix)]
+    {
+        #[cfg(target_os = "linux")]
+        let clock = libc::CLOCK_BOOTTIME;
+        #[cfg(not(target_os = "linux"))]
+        let clock = libc::CLOCK_MONOTONIC;
+        let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        // SAFETY: clock_gettime initializes the timespec on success.
+        if unsafe { libc::clock_gettime(clock, time.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let time = unsafe { time.assume_init() };
+        Some(Duration::new(
+            u64::try_from(time.tv_sec).ok()?,
+            u32::try_from(time.tv_nsec).ok()?,
+        ))
+    }
+    #[cfg(windows)]
+    {
+        // SAFETY: GetTickCount64 has no preconditions.
+        Some(Duration::from_millis(unsafe {
+            windows_sys::Win32::System::SystemInformation::GetTickCount64()
+        }))
+    }
+}
+
 fn unix_timestamp_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -423,6 +530,70 @@ fn unix_timestamp_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_pair_receipt_does_not_advance_on_reads_and_keeps_configured_total_distinct() {
+        let writer = MetricsWriter::default();
+        let handle = writer.handle();
+        writer.set_memory_total_bytes(8192);
+        assert!(writer.record_guest_memory_observation(0, 8000, 1000, Duration::from_secs(5)));
+        let first = handle.guest_memory_observation().unwrap();
+        assert_eq!(first.total_bytes, 8000);
+        assert_eq!(handle.snapshot().memory.total_bytes, 8192);
+        assert_eq!(handle.guest_memory_observation().unwrap(), first);
+    }
+
+    #[test]
+    fn lifecycle_invalidation_rejects_in_flight_old_responses() {
+        let writer = MetricsWriter::default();
+        let handle = writer.handle();
+        let before = writer.guest_memory_epoch();
+        assert!(writer.record_guest_memory_observation(before, 8000, 1000, Duration::from_secs(1)));
+        handle.invalidate_guest_memory_observation();
+        assert!(handle.guest_memory_observation().is_none());
+        assert!(!writer.record_guest_memory_observation(
+            before,
+            8000,
+            2000,
+            Duration::from_secs(1)
+        ));
+        let after = writer.guest_memory_epoch();
+        assert_ne!(before, after);
+        assert!(writer.record_guest_memory_observation(after, 9000, 3000, Duration::from_secs(1)));
+        writer.discard_guest_memory_observation(before);
+        assert_eq!(
+            handle.guest_memory_observation().unwrap().available_bytes,
+            3000
+        );
+        assert!(!writer.record_guest_memory_observation(after, 1000, 2000, Duration::from_secs(1)));
+        assert!(handle.guest_memory_observation().is_none());
+    }
+
+    #[test]
+    fn concurrent_guest_reports_never_mix_pair_fields_or_refresh_on_read() {
+        let writer = MetricsWriter::default();
+        let handle = writer.handle();
+        let publisher = std::thread::spawn(move || {
+            for available in 0..10_000 {
+                assert!(writer.record_guest_memory_observation(
+                    0,
+                    available + 1000,
+                    available,
+                    Duration::from_secs(1)
+                ));
+            }
+        });
+        while !publisher.is_finished() {
+            if let Some(report) = handle.guest_memory_observation() {
+                assert_eq!(report.total_bytes, report.available_bytes + 1000);
+            }
+        }
+        publisher.join().unwrap();
+        assert_eq!(
+            handle.guest_memory_observation().unwrap().available_bytes,
+            9999
+        );
+    }
 
     #[test]
     fn cpu_time_is_unavailable_until_written() {
