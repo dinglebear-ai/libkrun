@@ -276,7 +276,8 @@ impl VirtioDevice for Balloon {
 
         // The stats queue deliberately retains one consumed descriptor between samples. Return it
         // through the used ring so the captured queue satisfies consumed-or-terminal ownership.
-        self.trigger_stats_update();
+        self.return_stats_descriptor(None);
+        self.stats_request_epoch = None;
         self.stats_timer.disarm()?;
         let queues = self
             .queues

@@ -73,6 +73,12 @@ pub struct GuestMemoryObservation {
     /// Guest available memory from the same report.
     pub available_bytes: u64,
     /// Host-wide monotonic receipt time, not the host sampler's read time.
+    ///
+    /// The clock is `CLOCK_BOOTTIME` on Linux, `CLOCK_MONOTONIC` on other Unix
+    /// hosts, and `GetTickCount64` (milliseconds) on Windows. Compute age using
+    /// that same host clock; neither an arbitrary `Instant` nor wall time has
+    /// a comparable origin. Linux/Windows receipts include host suspend time;
+    /// other Unix hosts follow their `CLOCK_MONOTONIC` suspend semantics.
     pub received_at: Duration,
     /// Guest reporting interval, independent of host sampling cadence.
     pub reporting_interval: Duration,
@@ -152,7 +158,8 @@ struct BlockDeviceState {
 
 impl MetricsHandle {
     /// Return the last coherent report without refreshing its receipt time.
-    /// Callers apply freshness using the guest cadence and the host monotonic clock.
+    /// Callers apply freshness using the guest cadence and the platform clock
+    /// documented on [`GuestMemoryObservation::received_at`].
     pub fn guest_memory_observation(&self) -> Option<GuestMemoryObservation> {
         self.state.guest_memory.lock().unwrap().observation
     }

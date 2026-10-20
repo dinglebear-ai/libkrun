@@ -212,6 +212,28 @@ impl Balloon {
     }
 
     pub(crate) fn trigger_stats_update(&mut self) {
+        // Timer and queue events can be dispatched in either order. Drain an
+        // already available report before authorizing another response: it was
+        // produced before this request and must not receive a fresh receipt.
+        // process_stq rearms the timer; defer the new request to that next tick
+        // so returning stale descriptors cannot overlap a new exchange here.
+        if let crate::virtio::DeviceState::Activated(ref mem, _) = self.device_state {
+            let queues = self
+                .queues
+                .as_ref()
+                .expect("queues should exist when activated");
+            if !queues[STQ_INDEX].queue.is_empty(mem) {
+                self.process_stq();
+                return;
+            }
+        }
+
+        self.return_stats_descriptor(Some(self.metrics.guest_memory_epoch()));
+    }
+
+    /// Release retained queue ownership. Quiescence passes no request epoch:
+    /// returning its buffer must not authorize fresh telemetry after restore.
+    pub(crate) fn return_stats_descriptor(&mut self, request_epoch: Option<u64>) {
         let Some(index) = self.stats_desc_index.take() else {
             debug!("balloon: stats timer fired without a retained descriptor");
             return;
@@ -228,7 +250,7 @@ impl Balloon {
 
         // Bind the next response to the current lifecycle epoch before waking
         // the guest. An in-flight pre-pause buffer keeps its earlier epoch.
-        self.stats_request_epoch = Some(self.metrics.guest_memory_epoch());
+        self.stats_request_epoch = request_epoch;
         if let Err(e) = queues[STQ_INDEX].queue.add_used(mem, index, 0) {
             self.stats_request_epoch = None;
             error!("balloon: failed to add used stats element: {e:?}");
@@ -403,11 +425,11 @@ mod tests {
     #[test]
     fn actual_stats_queue_requires_one_request_per_coherent_response() {
         let memory = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
-        let ring = VirtQueue::new(GuestAddress(0), &memory, 8);
+        let ring = VirtQueue::new(GuestAddress(0), &memory, 16);
         let metrics = MetricsWriter::default();
         let mut balloon = Balloon::new(metrics.clone(), Some(Duration::from_secs(1))).unwrap();
         let mut queues: Vec<_> = (0..super::super::defs::NUM_QUEUES)
-            .map(|_| DeviceQueue::new(Queue::new(8), Arc::new(EventFd::new(0).unwrap())))
+            .map(|_| DeviceQueue::new(Queue::new(16), Arc::new(EventFd::new(0).unwrap())))
             .collect();
         queues[STQ_INDEX].queue = ring.create_queue();
         balloon
@@ -438,36 +460,46 @@ mod tests {
         submit(0, 1000, 20);
         balloon.process_stq();
         assert!(metrics.handle().guest_memory_observation().is_none());
+        // The timer may run before a queued unsolicited buffer's event is dispatched.
+        // That old buffer must not consume a new request or acquire a fresh receipt.
+        submit(1, 1500, 20);
         balloon.trigger_stats_update();
-        submit(1, 2000, 20);
+        balloon.process_stq();
+        assert!(metrics.handle().guest_memory_observation().is_none());
+        assert!(balloon.stats_request_epoch.is_none());
+        balloon.trigger_stats_update();
+        submit(2, 2000, 20);
         balloon.process_stq();
         let accepted = metrics.handle().guest_memory_observation().unwrap();
         assert_eq!(accepted.available_bytes, 2000);
 
         // A noncompliant extra buffer must not inherit the previous request.
-        submit(2, 3000, 20);
+        submit(3, 3000, 20);
         balloon.process_stq();
         assert_eq!(metrics.handle().guest_memory_observation(), Some(accepted));
 
         // A malformed response consumes its request too; a later unsolicited
         // valid buffer cannot turn that failed exchange into a fresh report.
         balloon.trigger_stats_update();
-        submit(3, 4000, 19);
+        submit(4, 4000, 19);
         balloon.process_stq();
         assert!(metrics.handle().guest_memory_observation().is_none());
-        submit(4, 5000, 20);
+        submit(5, 5000, 20);
         balloon.process_stq();
         assert!(metrics.handle().guest_memory_observation().is_none());
 
         // Crossing a lifecycle boundary rejects a response already in flight.
         balloon.trigger_stats_update();
         metrics.handle().invalidate_guest_memory_observation();
-        submit(5, 6000, 20);
+        submit(6, 6000, 20);
         balloon.process_stq();
         assert!(metrics.handle().guest_memory_observation().is_none());
         balloon.trigger_stats_update();
-        submit(6, 7000, 20);
-        balloon.process_stq();
+        submit(7, 7000, 20);
+        // A response to the already outstanding request remains valid when its
+        // queue event loses the dispatch race to the timer.
+        balloon.trigger_stats_update();
+        assert!(balloon.stats_request_epoch.is_none());
         assert_eq!(
             metrics
                 .handle()
@@ -476,5 +508,15 @@ mod tests {
                 .available_bytes,
             7000
         );
+
+        // Quiescence must release the retained descriptor even with an extra
+        // report queued. A timer-style deferral would strand consumed ownership.
+        let used_before = ring.used.idx.get();
+        submit(8, 7500, 20);
+        let captured = balloon.quiesce().unwrap();
+        assert_eq!(ring.used.idx.get(), used_before + 1);
+        assert_eq!(captured[STQ_INDEX].queue.len(&memory), 1);
+        assert!(balloon.stats_desc_index.is_none());
+        assert!(balloon.stats_request_epoch.is_none());
     }
 }
