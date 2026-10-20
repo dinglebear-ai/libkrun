@@ -228,8 +228,8 @@ pub use api::vm::Vm;
 #[cfg(not(feature = "tee"))]
 pub use api::vm::{
     VmControl, VmCpuState, VmExecutionState, VmGenerationId, VmGenerationRequest,
-    VmGenerationState, VmGenerationWaitOutcome, VmMemoryRestoreSource, VmMemoryRestoreTarget,
-    VmMemoryState, VmPauseGeneration,
+    VmGenerationState, VmGenerationWaitOutcome, VmMemoryDeviceState, VmMemoryRestoreSource,
+    VmMemoryRestoreTarget, VmMemoryState, VmPauseGeneration,
 };
 #[cfg(all(feature = "blk", not(feature = "tee")))]
 pub use api::{
