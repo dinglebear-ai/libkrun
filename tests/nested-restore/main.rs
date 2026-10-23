@@ -93,6 +93,42 @@ fn progress(path: &std::path::Path) -> Option<Progress> {
         })
     })
 }
+
+// Read the general, SIMD and system register prefix of the HVF ABI 2 payload.
+// EL1 alone is insufficient: both the parent kernel and its child run there.
+#[cfg(target_os = "macos")]
+fn captured_parent_at_el1(state: &vmm::execution_state::ExecutionState) -> Result<bool> {
+    if state.backend() != vmm::execution_state::ExecutionBackend::Hvf
+        || state.backend_state_abi() != 2
+    {
+        return Err("EL1 capture check requires the HVF ABI 2 register layout".into());
+    }
+    type Registers = (Vec<(u32, u64)>, Vec<(u32, u128)>, Vec<(u16, u64)>);
+
+    let mut all_at_el1 = !state.vcpus().is_empty();
+    for cpu in state.vcpus() {
+        let ((general, _, system), _): (Registers, usize) =
+            bincode::serde::decode_from_slice(cpu.bytes(), bincode::config::standard())?;
+        let cpsr = general
+            .iter()
+            .find(|(register, _)| *register == hvf::bindings::hv_reg_t_HV_REG_CPSR)
+            .ok_or("captured CPU has no CPSR")?
+            .1;
+        let hcr = system
+            .iter()
+            .find(|(register, _)| *register == hvf::bindings::hv_sys_reg_t_HV_SYS_REG_HCR_EL2)
+            .ok_or("captured CPU has no HCR_EL2")?
+            .1;
+        // PSTATE.M identifies AArch64 EL1t (4) or EL1h (5). In this fixture,
+        // Linux clears HCR_EL2.VM when it leaves the child for the parent.
+        // Require both: an EL1 child with stage-2 translation still enabled
+        // does not exercise the parent's next hypercall after restore.
+        all_at_el1 &= matches!(cpsr & 0x1f, 4 | 5) && hcr & 1 == 0;
+        eprintln!("captured vCPU {} CPSR={cpsr:#x} HCR_EL2={hcr:#x}", cpu.id());
+    }
+    Ok(all_at_el1)
+}
+
 fn main() -> Result<()> {
     let mode = std::env::args()
         .nth(1)
@@ -158,9 +194,13 @@ fn main() -> Result<()> {
         })
         .build()?;
     if mode == "restore" {
-        vm.set_execution_restore(vmm::execution_state::ExecutionState::decode(&fs::read(
-            snapshot.join("execution"),
-        )?)?);
+        let execution =
+            vmm::execution_state::ExecutionState::decode(&fs::read(snapshot.join("execution"))?)?;
+        #[cfg(target_os = "macos")]
+        if !captured_parent_at_el1(&execution)? {
+            return Err("macOS regression requires every parent vCPU captured at EL1".into());
+        }
+        vm.set_execution_restore(execution);
         vm.set_memory_restore(Memory(fs::File::open(snapshot.join("memory"))?));
         for entry in fs::read_dir(&snapshot)? {
             let entry = entry?;
@@ -227,14 +267,27 @@ fn main() -> Result<()> {
                 }
                 thread::sleep(Duration::from_millis(200));
             }
-            let _pause = control.pause()?;
+            #[allow(unused_mut, unused_variables)]
+            let mut pause = control.pause()?;
             if mode == "capture" || output_snapshot.is_some() {
+                #[allow(unused_mut)]
+                let mut execution = control.capture_execution_state()?;
+                #[cfg(target_os = "macos")]
+                {
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    while !captured_parent_at_el1(&execution)? {
+                        if Instant::now() >= deadline {
+                            return Err("could not capture every parent vCPU at EL1".into());
+                        }
+                        control.resume(pause)?;
+                        thread::sleep(Duration::from_millis(10));
+                        pause = control.pause()?;
+                        execution = control.capture_execution_state()?;
+                    }
+                }
                 let snapshot = output_snapshot.as_ref().unwrap_or(&snapshot);
                 fs::create_dir_all(snapshot)?;
-                fs::write(
-                    snapshot.join("execution"),
-                    control.capture_execution_state()?.encode()?,
-                )?;
+                fs::write(snapshot.join("execution"), execution.encode()?)?;
                 let plan = control.plan_full_memory_capture()?;
                 control.capture_memory(
                     &plan,
