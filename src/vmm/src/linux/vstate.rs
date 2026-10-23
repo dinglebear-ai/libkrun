@@ -1254,6 +1254,8 @@ type VcpuCell = Cell<Option<*mut Vcpu>>;
 /// A wrapper around creating and using a kvm-based VCPU.
 pub struct Vcpu {
     fd: VcpuFd,
+    #[cfg(target_arch = "x86_64")]
+    tsc_scaling_supported: bool,
     id: u8,
     // Resolved host placement is applied inside the vCPU thread before KVM_RUN.
     host_cpu: Option<HostCpuId>,
@@ -1298,6 +1300,24 @@ pub struct Vcpu {
 }
 
 impl Vcpu {
+    #[cfg(target_arch = "x86_64")]
+    fn validate_tsc_frequency(&self, tsc_frequency_hz: u64) -> Result<u32> {
+        let khz = super::tsc_frequency::to_khz(tsc_frequency_hz)
+            .map_err(|error| Error::StateCodec(error.into()))?;
+        if khz == 0 {
+            return Err(Error::StateCodec("zero saved TSC frequency".into()));
+        }
+        let current = self.fd.get_tsc_khz().map_err(Error::VcpuGetTscKhz)?;
+        // Without hardware scaling KVM may accept a higher rate using catch-up
+        // emulation. That does not preserve RDTSC timing inside a running L2.
+        if khz != current && !self.tsc_scaling_supported {
+            return Err(Error::StateCodec(format!(
+                "snapshot TSC rate {khz} kHz differs from destination {current} kHz; KVM TSC scaling is unsupported"
+            )));
+        }
+        Ok(khz)
+    }
+
     thread_local!(static TLS_VCPU_PTR: VcpuCell = const { Cell::new(None) });
 
     /// Associates `self` with the current thread.
@@ -1416,6 +1436,7 @@ impl Vcpu {
         // Initially the cpuid per vCPU is the one supported by this VM.
         Ok(Vcpu {
             fd: kvm_vcpu,
+            tsc_scaling_supported: vm_fd.check_extension(Cap::TscControl),
             id,
             host_cpu: None,
             host_cpu_required: true,
@@ -1769,7 +1790,8 @@ impl Vcpu {
             .fd
             .get_vcpu_events()
             .map_err(Error::VcpuGetVcpuEvents)?;
-        let tsc_khz = self.fd.get_tsc_khz().map_err(Error::VcpuGetTscKhz)?;
+        let tsc_frequency_hz =
+            u64::from(self.fd.get_tsc_khz().map_err(Error::VcpuGetTscKhz)?) * 1000;
         Ok(VcpuState {
             cpuid: self
                 .cpuid
@@ -1792,7 +1814,7 @@ impl Vcpu {
             vcpu_events,
             xcrs,
             xsave,
-            tsc_khz,
+            tsc_frequency_hz,
         })
     }
 
@@ -1852,12 +1874,7 @@ impl Vcpu {
                 "destination CPUID differs from nested snapshot".into(),
             ));
         }
-        let frequency = self.fd.get_tsc_khz().map_err(Error::VcpuGetTscKhz)?;
-        if state.tsc_khz != frequency {
-            return Err(Error::StateCodec(
-                "destination TSC frequency differs from nested snapshot".into(),
-            ));
-        }
+        self.validate_tsc_frequency(state.tsc_frequency_hz)?;
         if state.msrs.len() != self.msr_list.as_slice().len()
             || state
                 .msrs
@@ -1984,10 +2001,15 @@ impl Vcpu {
             *target = (*source).into();
         }
 
+        let tsc_frequency_hz = state.tsc_frequency_hz;
+        let tsc_khz = self.validate_tsc_frequency(tsc_frequency_hz)?;
         self.fd.set_cpuid2(&cpuid).map_err(Error::VcpuSetCpuid)?;
-        self.fd
-            .set_tsc_khz(state.tsc_khz)
-            .map_err(Error::VcpuSetTscKhz)?;
+        self.fd.set_tsc_khz(tsc_khz).map_err(Error::VcpuSetTscKhz)?;
+        if self.fd.get_tsc_khz().map_err(Error::VcpuGetTscKhz)? != tsc_khz {
+            return Err(Error::StateCodec(
+                "destination cannot preserve guest TSC frequency".into(),
+            ));
+        }
         self.fd
             .set_mp_state(state.mp_state)
             .map_err(Error::VcpuSetMpState)?;
@@ -2540,7 +2562,9 @@ pub struct VcpuState {
     vcpu_events: kvm_vcpu_events,
     xcrs: kvm_xcrs,
     xsave: kvm_xsave,
-    tsc_khz: u32,
+    // Keep the existing u32 kHz snapshot encoding; use Hz everywhere in memory.
+    #[serde(with = "super::tsc_frequency")]
+    tsc_frequency_hz: u64,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2861,7 +2885,7 @@ mod tests {
             vcpu_events: Default::default(),
             xcrs: Default::default(),
             xsave: Default::default(),
-            tsc_khz: 2400000,
+            tsc_frequency_hz: 2_400_000_000,
         };
         let legacy = bincode::serde::encode_to_vec(&state, bincode::config::standard()).unwrap();
         assert_eq!(state.encode_execution_payload(None).unwrap(), legacy);
@@ -2881,7 +2905,7 @@ mod tests {
         assert_eq!(restored.regs.rax, 42);
         assert_eq!(restored.cpuid[0].ecx, 1 << 5);
         assert_eq!(restored.msrs[0].data, 12345);
-        assert_eq!(restored.tsc_khz, 2400000);
+        assert_eq!(restored.tsc_frequency_hz, 2_400_000_000);
         assert_eq!(restored.encode_execution_payload(None).unwrap(), legacy);
 
         assert!(VcpuState::decode_execution_payload(&legacy, true).is_err());
